@@ -261,6 +261,7 @@ class ControllerTestWidget(QWidget):
     def __init__(self, device: USBDevice, scan_axes: list[str],
                  button_count: int, has_hat: bool,
                  axis_bit_sizes: list[int] | None = None,
+                 field_map: str = "",
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._device = device
@@ -268,6 +269,7 @@ class ControllerTestWidget(QWidget):
         self._button_count = button_count
         self._has_hat = has_hat
         self._axis_bit_sizes = axis_bit_sizes or []
+        self._field_map = field_map
         self._monitor: ControllerMonitorThread | None = None
 
         self._prev_buttons: dict[int, bool] = {}
@@ -462,8 +464,9 @@ class ControllerTestWidget(QWidget):
         # Buttons
         btn_box = QGroupBox(f"Buttons  ({self._button_count})")
         btn_grid = QGridLayout(btn_box)
-        btn_grid.setSpacing(4)
-        cols = 8
+        btn_grid.setSpacing(5)
+        # Scale columns: up to 8 wide for many buttons, 4 wide for few
+        cols = 8 if self._button_count > 8 else max(4, self._button_count)
         for i in range(self._button_count):
             lbl = QLabel(str(i + 1))
             lbl.setFixedSize(_BTN_SIZE, _BTN_SIZE)
@@ -524,6 +527,7 @@ class ControllerTestWidget(QWidget):
             button_count=self._button_count,
             has_hat=self._has_hat,
             axis_bit_sizes=self._axis_bit_sizes or None,
+            field_map=self._field_map,
             parent=self,
         )
         self._monitor.state_updated.connect(self._on_state)

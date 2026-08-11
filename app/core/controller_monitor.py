@@ -59,6 +59,48 @@ _HAT_DIRECTIONS = [
     "Centered",
 ]
 
+
+# ---------------------------------------------------------------------------
+# Parsed report-field entry (mirrors controller_inspector.ReportField)
+# Used here without importing the inspector to keep the dependency graph clean.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _RF:
+    """One decoded entry from the Report Field Map string."""
+    kind: str        # "axis" | "hat" | "buttons" | "padding"
+    name: str
+    bit_offset: int
+    bit_size: int
+    count: int       # 1 for axis/hat, N for button block
+
+
+def _parse_field_map(field_map: str) -> list[_RF]:
+    """Deserialise the 'Report Field Map' string stored by ControllerInspector.
+
+    Format: "kind:name:bit_offset:bit_size:count|kind:name:..."
+    Returns an empty list on any parse failure.
+    """
+    fields: list[_RF] = []
+    if not field_map:
+        return fields
+    try:
+        for entry in field_map.split("|"):
+            parts = entry.split(":", 4)
+            if len(parts) != 5:
+                continue
+            kind, name, bit_offset, bit_size, count = parts
+            fields.append(_RF(
+                kind=kind.strip(),
+                name=name.strip(),
+                bit_offset=int(bit_offset),
+                bit_size=int(bit_size),
+                count=int(count),
+            ))
+    except (ValueError, IndexError):
+        return []
+    return fields
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -301,10 +343,15 @@ class AxisDescriptor:
 class ReportDecoder:
     """Decodes raw HID report bytes into an InputState.
 
-    Supports two modes:
-      1. Descriptor-driven — uses AxisDescriptor list when available
-      2. Bit-size-aware    — uses per-axis bit sizes from _HIDAnalysis
-      3. Auto-detect       — heuristically decodes standard HID layouts
+    Three decoding modes (in priority order):
+      1. Field-map-driven  — uses the ordered ReportField list produced by
+                             the scan-time descriptor parser.  This is the
+                             only mode that correctly handles descriptors
+                             where hat, axes, and buttons are interleaved
+                             (e.g. WingMan: X, Y, Hat, Rz, Buttons, Slider).
+      2. Bit-size-aware    — uses per-axis bit sizes but assumes axes first,
+                             hat next, buttons last.  Fallback when no map.
+      3. Auto-detect       — heuristic uniform-width decode.  Last resort.
     """
 
     def __init__(
@@ -314,44 +361,39 @@ class ReportDecoder:
         has_hat: bool,
         axis_descriptors: list[AxisDescriptor] | None = None,
         axis_bit_sizes: list[int] | None = None,
+        field_map: str = "",
     ) -> None:
-        self._axis_names = axis_names
-        self._button_count = button_count
-        self._has_hat = has_hat
-        self._descriptors = axis_descriptors
-        # Per-axis bit sizes from the parsed report descriptor.
-        # When present, this gives exact decoding without descriptor-level detail.
+        self._axis_names    = axis_names
+        self._button_count  = button_count
+        self._has_hat       = has_hat
+        self._descriptors   = axis_descriptors
         self._axis_bit_sizes: list[int] = axis_bit_sizes or []
-        self._interpreter = MotionInterpreter(dead_zone=15.0)
+        self._interpreter   = MotionInterpreter(dead_zone=15.0)
 
-        # Pre-compute axis bit layout so we decode the same way every poll.
-        self._axis_layout: list[tuple[str, int, int]] = []  # (name, bit_offset, bit_size)
+        # Parse the ordered field map if provided
+        self._fields: list[_RF] = _parse_field_map(field_map) if field_map else []
+
+        # Legacy fallback layout (only used when no field map)
+        self._axis_layout: list[tuple[str, int, int]] = []
         self._hat_bit_offset: int = 0
         self._btn_bit_offset: int = 0
-        self._compute_layout()
+        if not self._fields:
+            self._compute_legacy_layout()
 
-    def _compute_layout(self) -> None:
-        """Pre-compute bit offsets for axes, hat, and buttons."""
+    def _compute_legacy_layout(self) -> None:
+        """Fallback: assume axes packed first, then hat, then buttons."""
         bit_cursor = 0
         n_axes = len(self._axis_names)
-
-        # Use provided bit sizes, or auto-detect uniform width
-        if len(self._axis_bit_sizes) == n_axes and n_axes > 0:
-            sizes = self._axis_bit_sizes
-        else:
-            # Auto-detect: prefer 10-bit if we have enough data headroom
-            # (will be refined in decode() when we know report length)
-            sizes = []  # empty = defer to _auto_decode_axes
-
+        sizes = (self._axis_bit_sizes
+                 if len(self._axis_bit_sizes) == n_axes and n_axes > 0
+                 else [])
         for i, name in enumerate(self._axis_names):
             bits = sizes[i] if i < len(sizes) else 10
             self._axis_layout.append((name, bit_cursor, bits))
             bit_cursor += bits
-
         self._hat_bit_offset = bit_cursor
         if self._has_hat:
-            bit_cursor += 4  # hat is always 4 bits in standard HID
-
+            bit_cursor += 4
         self._btn_bit_offset = bit_cursor
 
     def decode(self, data: bytes) -> InputState:
@@ -359,20 +401,84 @@ class ReportDecoder:
         if not data:
             return state
 
-        if self._descriptors:
-            state.axes = self._decode_axes_from_descriptors(data)
+        if self._fields:
+            state.axes, state.hat, state.buttons = self._decode_from_field_map(data)
+        elif self._descriptors:
+            state.axes    = self._decode_axes_from_descriptors(data)
+            state.hat     = self._decode_hat_legacy(data)
+            state.buttons = self._decode_buttons_legacy(data)
         elif self._axis_layout and all(bits > 0 for _, _, bits in self._axis_layout):
-            state.axes = self._decode_axes_from_layout(data)
+            state.axes    = self._decode_axes_from_layout(data)
+            state.hat     = self._decode_hat_legacy(data)
+            state.buttons = self._decode_buttons_legacy(data)
         else:
-            state.axes = self._auto_decode_axes(data)
+            state.axes    = self._auto_decode_axes(data)
+            state.hat     = self._decode_hat_legacy(data)
+            state.buttons = self._decode_buttons_legacy(data)
 
-        state.buttons = self._decode_buttons(data)
-        state.hat     = self._decode_hat(data)
-        state.motion  = self._interpreter.interpret(state.axes)
+        state.motion = self._interpreter.interpret(state.axes)
         return state
 
     # ------------------------------------------------------------------
-    # Layout-driven decoding (uses pre-computed bit offsets)
+    # Primary: field-map-driven decoding
+    # ------------------------------------------------------------------
+
+    def _decode_from_field_map(
+        self, data: bytes
+    ) -> tuple[list[AxisState], HatState | None, list[ButtonState]]:
+        """Decode every field using the ordered bit-offset map from the scan."""
+        axes:    list[AxisState]   = []
+        buttons: list[ButtonState] = []
+        hat:     HatState | None   = None
+        btn_index = 1   # 1-based button numbering across all button blocks
+
+        for f in self._fields:
+            if f.kind == "padding":
+                continue
+
+            elif f.kind == "axis":
+                raw = _extract_bits(data, f.bit_offset, f.bit_size)
+                if raw is None:
+                    continue
+                max_val = (1 << f.bit_size) - 1
+                pct = (raw / max_val) * 100.0 if max_val else 0.0
+                deg = (raw / max_val) * 359.9 if max_val else 0.0
+                is_rot = any(k in f.name.lower()
+                             for k in ("rotation","rz","rx","ry","rudder","twist"))
+                axes.append(AxisState(
+                    name=f.name, raw=raw, max_value=max_val,
+                    percent=round(pct, 1), degrees=round(deg, 1),
+                    is_rotation=is_rot,
+                ))
+
+            elif f.kind == "hat":
+                raw = _extract_bits(data, f.bit_offset, f.bit_size)
+                if raw is None:
+                    continue
+                hat_raw = raw if raw <= 8 else 8
+                direction = (_HAT_DIRECTIONS[hat_raw]
+                             if hat_raw < len(_HAT_DIRECTIONS) else "Centered")
+                deg_map = [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0]
+                deg = deg_map[hat_raw] if hat_raw < 8 else None
+                hat = HatState(raw=hat_raw, direction=direction, degrees=deg)
+
+            elif f.kind == "buttons":
+                # f.count real buttons packed as f.bit_size bits each
+                for b in range(f.count):
+                    bit_pos = f.bit_offset + b * f.bit_size
+                    raw = _extract_bits(data, bit_pos, f.bit_size)
+                    pressed = bool(raw) if raw is not None else False
+                    buttons.append(ButtonState(
+                        index=btn_index,
+                        pressed=pressed,
+                        label=f"Button {btn_index}",
+                    ))
+                    btn_index += 1
+
+        return axes, hat, buttons
+
+    # ------------------------------------------------------------------
+    # Layout-driven decoding (legacy fallback — axes first)
     # ------------------------------------------------------------------
 
     def _decode_axes_from_layout(self, data: bytes) -> list[AxisState]:
@@ -384,7 +490,8 @@ class ReportDecoder:
             max_val = (1 << bit_size) - 1
             pct = (raw / max_val) * 100.0 if max_val else 0.0
             deg = (raw / max_val) * 359.9 if max_val else 0.0
-            is_rot = any(k in name.lower() for k in ("rotation", "rz", "rx", "ry", "rudder", "twist"))
+            is_rot = any(k in name.lower()
+                         for k in ("rotation","rz","rx","ry","rudder","twist"))
             axes.append(AxisState(
                 name=name, raw=raw, max_value=max_val,
                 percent=round(pct, 1), degrees=round(deg, 1),
@@ -465,10 +572,10 @@ class ReportDecoder:
         return axes
 
     # ------------------------------------------------------------------
-    # Button decoding
+    # Legacy button decoding (fallback when no field map)
     # ------------------------------------------------------------------
 
-    def _decode_buttons(self, data: bytes) -> list[ButtonState]:
+    def _decode_buttons_legacy(self, data: bytes) -> list[ButtonState]:
         """Extract button states from the pre-computed bit offset."""
         buttons = []
         if self._button_count == 0:
@@ -502,10 +609,10 @@ class ReportDecoder:
         return buttons
 
     # ------------------------------------------------------------------
-    # Hat decoding
+    # Legacy hat decoding (fallback when no field map)
     # ------------------------------------------------------------------
 
-    def _decode_hat(self, data: bytes) -> HatState | None:
+    def _decode_hat_legacy(self, data: bytes) -> HatState | None:
         """Extract hat switch value from the pre-computed bit offset."""
         if not self._has_hat or not data:
             return None
@@ -576,6 +683,7 @@ class ControllerMonitorThread(QThread):
         has_hat: bool,
         hid_path: bytes | None = None,
         axis_bit_sizes: list[int] | None = None,
+        field_map: str = "",
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -589,6 +697,7 @@ class ControllerMonitorThread(QThread):
         self._decoder = ReportDecoder(
             axis_names, button_count, has_hat,
             axis_bit_sizes=axis_bit_sizes,
+            field_map=field_map,
         )
 
     def run(self) -> None:

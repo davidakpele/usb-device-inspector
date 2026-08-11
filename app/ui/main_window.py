@@ -209,6 +209,13 @@ class MainWindow(QMainWindow):
         self._test_btn.clicked.connect(self._on_test_controller)
         btn_row.addWidget(self._test_btn)
 
+        self._drone_btn = QPushButton("🚁  Drone Simulator")
+        self._drone_btn.setEnabled(False)
+        self._drone_btn.setVisible(False)
+        self._drone_btn.setObjectName("primaryButton")
+        self._drone_btn.clicked.connect(self._on_drone_simulator)
+        btn_row.addWidget(self._drone_btn)
+
         self._refresh_btn = QPushButton("Refresh")
         self._refresh_btn.clicked.connect(self._on_refresh)
         btn_row.addWidget(self._refresh_btn)
@@ -305,6 +312,8 @@ class MainWindow(QMainWindow):
             self._scan_btn.setEnabled(False)
             self._test_btn.setVisible(False)
             self._test_btn.setEnabled(False)
+            self._drone_btn.setVisible(False)
+            self._drone_btn.setEnabled(False)
             self._hide_details()
 
     @Slot(str)
@@ -321,10 +330,12 @@ class MainWindow(QMainWindow):
         self._inspect_btn.setEnabled(True)
         self._scan_btn.setEnabled(True)
 
-        # Show "Test Controller Live" only for Game Controller category
+        # Show "Test Controller Live" and "Drone Simulator" only for Game Controller
         is_controller = device.category == DeviceCategory.GAME_CONTROLLER.value
         self._test_btn.setVisible(is_controller)
         self._test_btn.setEnabled(is_controller)
+        self._drone_btn.setVisible(is_controller)
+        self._drone_btn.setEnabled(is_controller)
 
         self._set_status(
             f"{device.name or device.device_id}  |  "
@@ -390,6 +401,7 @@ class MainWindow(QMainWindow):
         button_count = 0
         has_hat = False
         axis_bit_sizes: list[int] = []
+        field_map: str = ""
 
         if self._last_scan_details and self._last_scan_details.device.device_id == device.device_id:
             details = self._last_scan_details
@@ -410,6 +422,8 @@ class MainWindow(QMainWindow):
                                 axis_bit_sizes = [int(x) for x in f.value.split(",")]
                             except ValueError:
                                 axis_bit_sizes = []
+                        if f.label == "Report Field Map" and f.value:
+                            field_map = f.value
                     break
 
         if not scan_axes:
@@ -423,6 +437,7 @@ class MainWindow(QMainWindow):
             button_count=button_count,
             has_hat=has_hat,
             axis_bit_sizes=axis_bit_sizes,
+            field_map=field_map,
             parent=None,
         )
         win.setStyleSheet(self.styleSheet())
@@ -431,6 +446,79 @@ class MainWindow(QMainWindow):
             self._test_windows: list = []
         self._test_windows.append(win)
         win.destroyed.connect(lambda: self._test_windows.remove(win) if win in self._test_windows else None)
+
+    # ------------------------------------------------------------------
+    # Drone simulator
+    # ------------------------------------------------------------------
+
+    @Slot()
+    def _on_drone_simulator(self) -> None:
+        """Open the 3D drone simulator for the selected controller."""
+        device = self._selected_device
+        if not device:
+            return
+        self._open_drone_simulator(device)
+
+    def _open_drone_simulator(self, device: USBDevice) -> None:
+        """Extract scan-time HID info and launch DroneSimulatorWindow."""
+        from app.ui.drone_simulator import DroneSimulatorWindow
+
+        scan_axes: list[str] = []
+        button_count = 0
+        has_hat = False
+        axis_bit_sizes: list[int] = []
+        field_map: str = ""
+
+        if (self._last_scan_details
+                and self._last_scan_details.device.device_id == device.device_id):
+            for section in self._last_scan_details.sections:
+                if section.title == "HID Analysis":
+                    for f in section.fields:
+                        if f.label == "Axes" and f.value:
+                            scan_axes = [a.strip() for a in f.value.split(",")
+                                         if a.strip()]
+                        if f.label == "Button Count" and f.value and f.value.isdigit():
+                            button_count = int(f.value)
+                        if (f.label == "Hat Switch(es)" and f.value
+                                and f.value not in ("Not Available", "None")):
+                            try:
+                                has_hat = int(f.value) > 0
+                            except ValueError:
+                                has_hat = False
+                        if f.label == "Axis Bit Sizes" and f.value:
+                            try:
+                                axis_bit_sizes = [int(x)
+                                                  for x in f.value.split(",")]
+                            except ValueError:
+                                axis_bit_sizes = []
+                        if f.label == "Report Field Map" and f.value:
+                            field_map = f.value
+                    break
+
+        # Sensible defaults if no scan was performed yet
+        if not scan_axes:
+            scan_axes = ["X Axis", "Y Axis", "Rz (Z Rotation)", "Slider"]
+        if button_count == 0:
+            button_count = 7
+
+        win = DroneSimulatorWindow(
+            device=device,
+            scan_axes=scan_axes,
+            button_count=button_count,
+            has_hat=has_hat,
+            axis_bit_sizes=axis_bit_sizes,
+            field_map=field_map,
+            parent=None,
+        )
+        win.setStyleSheet(self.styleSheet())
+        win.show()
+        if not hasattr(self, "_drone_windows"):
+            self._drone_windows: list = []
+        self._drone_windows.append(win)
+        win.destroyed.connect(
+            lambda: self._drone_windows.remove(win)
+            if win in self._drone_windows else None
+        )
 
     @Slot()
     def _on_show_history(self) -> None:

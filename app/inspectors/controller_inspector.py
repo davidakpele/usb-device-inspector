@@ -85,12 +85,37 @@ _AXIS_USAGES: dict[int, str] = {
 # ---------------------------------------------------------------------------
 
 @dataclass
+class ReportField:
+    """One logical field extracted from the HID report descriptor.
+
+    Preserves the exact bit offset within the input report so the live
+    monitor can decode every field without guessing byte boundaries.
+
+    kind values:
+      "axis"    — an analog axis (X, Y, Rz, Slider, …)
+      "hat"     — hat switch (4-bit, 0-7 = direction, 8 = centred)
+      "buttons" — a block of N button bits starting at bit_offset
+      "padding" — constant / padding bits; must be skipped during decode
+    """
+    kind: str           # "axis" | "hat" | "buttons" | "padding"
+    name: str           # human label ("X Axis", "Button Block 1", …)
+    bit_offset: int     # position of the first bit in the input report
+    bit_size: int       # bits per field (per axis, or total for button block)
+    count: int = 1      # number of items (1 for axis/hat, N for buttons)
+    max_value: int = 0  # logical max (0 = derive from bit_size)
+
+
+@dataclass
 class _HIDAnalysis:
     """Aggregated results from parsing a HID report descriptor."""
     top_level_usage_page: int | None = None
     top_level_usage: int | None = None
+    # Ordered list of all input fields in descriptor order — used by the
+    # live monitor for bit-exact decoding.
+    ordered_fields: list[ReportField] = field(default_factory=list)
+    # Convenience summaries (derived from ordered_fields after parsing)
     axes: list[str] = field(default_factory=list)
-    axis_bit_sizes: list[int] = field(default_factory=list)   # per-axis bit width
+    axis_bit_sizes: list[int] = field(default_factory=list)
     hat_count: int = 0
     button_count: int = 0
     has_force_feedback: bool = False
@@ -102,13 +127,18 @@ class _HIDAnalysis:
 def _parse_report_descriptor(raw: bytes) -> _HIDAnalysis:
     """Parse raw HID report descriptor bytes into an _HIDAnalysis.
 
-    This is a deliberately minimal parser — it only extracts the fields we
-    display, not a full HID stack. It handles short items only (no long items
-    past the 0xFE tag) and ignores COLLECTION/END_COLLECTION nesting beyond
-    counting top-level application collections for the top usage.
+    Tracks a running ``bit_cursor`` so every field's exact bit offset within
+    the input report is recorded in ``analysis.ordered_fields``.  This lets
+    the live monitor decode axes, hat, buttons, and padding in the correct
+    order without any byte-boundary guesswork.
 
-    Returns a default _HIDAnalysis (all None/empty) on any parse error rather
-    than raising — the caller always gets a safe, displayable result.
+    Key correctness rules:
+    * Input items with Data flag (bit 0 of the Input tag data = 0) are real
+      fields.  Input items with Constant flag (bit 0 = 1) are padding and
+      must advance the bit cursor but never produce a button or axis.
+    * Button count counts only Data buttons, not Constant padding bits.
+    * Fields are appended in the order they appear in the descriptor, which
+      is the order they appear in the input report.
     """
     analysis = _HIDAnalysis()
 
@@ -116,24 +146,26 @@ def _parse_report_descriptor(raw: bytes) -> _HIDAnalysis:
     usage_page: int = 0
     report_count: int = 0
     report_size: int = 0
+    logical_max: int = 0
 
-    # Local state (reset at each Main item)
+    # Local state (reset after each Main item)
     usages: list[int] = []
     usage_minimum: int | None = None
     usage_maximum: int | None = None
 
+    # Running bit cursor — tracks position within the input report
+    bit_cursor: int = 0
     in_top_collection = False
     i = 0
+
     try:
         while i < len(raw):
             prefix = raw[i]
             i += 1
 
-            if prefix == 0xFE:
-                # Long item — skip (data_size in next byte)
+            if prefix == 0xFE:          # long item — skip
                 if i < len(raw):
-                    skip = raw[i]
-                    i += 1 + skip
+                    skip = raw[i]; i += 1 + skip
                 continue
 
             size_code = prefix & 0x03
@@ -145,76 +177,118 @@ def _parse_report_descriptor(raw: bytes) -> _HIDAnalysis:
                 break
             raw_value = raw[i: i + size]
             i += size
-
             value = int.from_bytes(raw_value, "little", signed=False) if size > 0 else 0
 
-            # ── Global items (type = 1) ──────────────────────────────
+            # ── Global items ──────────────────────────────────────────
             if item_type == 1:
-                if tag == 0x0:    # Usage Page
-                    usage_page = value
-                    # Check for force-feedback usage page
-                    if value == _USAGE_PAGE_PID:
-                        analysis.has_force_feedback = True
-                elif tag == 0x7:  # Report Size (bits)
-                    report_size = value
-                elif tag == 0x9:  # Report Count
-                    report_count = value
+                if tag == 0x0:   usage_page   = value
+                elif tag == 0x7: report_size  = value
+                elif tag == 0x9: report_count = value
+                elif tag == 0x4: logical_max  = value  # Logical Maximum
+                if value == _USAGE_PAGE_PID:
+                    analysis.has_force_feedback = True
 
-            # ── Local items (type = 2) ───────────────────────────────
+            # ── Local items ───────────────────────────────────────────
             elif item_type == 2:
-                if tag == 0x0:    # Usage
-                    usages.append(value)
-                elif tag == 0x1:  # Usage Minimum
-                    usage_minimum = value
-                elif tag == 0x2:  # Usage Maximum
-                    usage_maximum = value
+                if tag == 0x0:   usages.append(value)
+                elif tag == 0x1: usage_minimum = value
+                elif tag == 0x2: usage_maximum = value
 
-            # ── Main items (type = 0) ────────────────────────────────
+            # ── Main items ────────────────────────────────────────────
             elif item_type == 0:
+
                 if tag == 0xA:  # Collection
-                    if not in_top_collection:
-                        # First top-level application collection gives us the
-                        # primary usage page + usage.
-                        if usages:
-                            analysis.top_level_usage_page = usage_page
-                            analysis.top_level_usage = usages[-1]
+                    if not in_top_collection and usages:
+                        analysis.top_level_usage_page = usage_page
+                        analysis.top_level_usage = usages[-1]
                         in_top_collection = True
 
                 elif tag == 0x8:  # Input
-                    # Determine what this input report represents.
-                    if usage_page == _USAGE_PAGE_BUTTON:
-                        # Button range
+                    total_bits = report_size * report_count
+                    # Input data flag: bit 0 of the Input tag data byte.
+                    # 0 = Data (real field), 1 = Constant (padding).
+                    is_constant = bool(value & 0x01)
+
+                    if is_constant:
+                        # Padding — advance cursor, record as padding field
+                        analysis.ordered_fields.append(ReportField(
+                            kind="padding", name=f"Padding@{bit_cursor}",
+                            bit_offset=bit_cursor,
+                            bit_size=report_size, count=report_count,
+                        ))
+                        bit_cursor += total_bits
+
+                    elif usage_page == _USAGE_PAGE_BUTTON:
+                        # Real button block
                         if usage_minimum is not None and usage_maximum is not None:
-                            analysis.button_count += (usage_maximum - usage_minimum + 1)
+                            n_buttons = usage_maximum - usage_minimum + 1
                         elif usages:
-                            analysis.button_count += len(usages)
+                            n_buttons = len(usages)
                         else:
-                            analysis.button_count += report_count
+                            n_buttons = report_count
+                        analysis.ordered_fields.append(ReportField(
+                            kind="buttons",
+                            name=f"Buttons {analysis.button_count + 1}–"
+                                 f"{analysis.button_count + n_buttons}",
+                            bit_offset=bit_cursor,
+                            bit_size=report_size,
+                            count=n_buttons,
+                            max_value=1,
+                        ))
+                        analysis.button_count += n_buttons
+                        bit_cursor += total_bits   # includes any padding bits in this Input
 
                     elif usage_page == _USAGE_PAGE_GENERIC_DESKTOP:
-                        for u in usages:
-                            if u in _AXIS_USAGES:
+                        # Resolve usage list from explicit usages or min/max range
+                        resolved: list[int] = list(usages)
+                        if not resolved and usage_minimum is not None and usage_maximum is not None:
+                            resolved = list(range(usage_minimum, usage_maximum + 1))
+
+                        if not resolved:
+                            # Unknown generic desktop field — treat as padding
+                            analysis.ordered_fields.append(ReportField(
+                                kind="padding", name=f"GD-unknown@{bit_cursor}",
+                                bit_offset=bit_cursor,
+                                bit_size=report_size, count=report_count,
+                            ))
+                            bit_cursor += total_bits
+                        else:
+                            for u in resolved:
+                                if u not in _AXIS_USAGES:
+                                    # Unknown usage within GD — advance 1 field
+                                    bit_cursor += report_size
+                                    continue
                                 label = _AXIS_USAGES[u]
                                 if label == "Hat Switch":
+                                    analysis.ordered_fields.append(ReportField(
+                                        kind="hat", name="Hat Switch",
+                                        bit_offset=bit_cursor,
+                                        bit_size=report_size, count=1,
+                                        max_value=logical_max,
+                                    ))
                                     analysis.hat_count += 1
-                                elif label not in analysis.axes:
-                                    analysis.axes.append(label)
-                                    analysis.axis_bit_sizes.append(report_size)
-                        if usage_minimum is not None and usage_maximum is not None:
-                            for u in range(usage_minimum, usage_maximum + 1):
-                                if u in _AXIS_USAGES:
-                                    label = _AXIS_USAGES[u]
-                                    if label == "Hat Switch":
-                                        analysis.hat_count += 1
-                                    elif label not in analysis.axes:
+                                    bit_cursor += report_size
+                                else:
+                                    if label not in analysis.axes:
                                         analysis.axes.append(label)
                                         analysis.axis_bit_sizes.append(report_size)
+                                    analysis.ordered_fields.append(ReportField(
+                                        kind="axis", name=label,
+                                        bit_offset=bit_cursor,
+                                        bit_size=report_size, count=1,
+                                        max_value=logical_max,
+                                    ))
+                                    bit_cursor += report_size
 
                     elif usage_page == _USAGE_PAGE_PID:
                         analysis.has_force_feedback = True
+                        bit_cursor += total_bits
+
+                    else:
+                        # Unknown usage page — skip
+                        bit_cursor += total_bits
 
                 elif tag == 0x9:  # Output
-                    # Output reports on PID page indicate force-feedback actuators.
                     if usage_page == _USAGE_PAGE_PID:
                         analysis.has_force_feedback = True
                         analysis.has_rumble = True
@@ -225,7 +299,7 @@ def _parse_report_descriptor(raw: bytes) -> _HIDAnalysis:
                 usage_maximum = None
 
     except Exception as exc:  # noqa: BLE001
-        logger.debug("HID report descriptor parse error: %s", exc)
+        logger.debug("HID report descriptor parse error at bit %d: %s", bit_cursor, exc)
 
     return analysis
 
@@ -504,6 +578,14 @@ class ControllerInspector(BaseInspector):
                     ",".join(str(b) for b in analysis.axis_bit_sizes),
                     source="Directly Reported",
                 )
+            # Store the full ordered field map for bit-exact live decoding
+            # Format: "kind:name:bit_offset:bit_size:count" per field, "|" separated
+            if analysis.ordered_fields:
+                field_map = "|".join(
+                    f"{f.kind}:{f.name}:{f.bit_offset}:{f.bit_size}:{f.count}"
+                    for f in analysis.ordered_fields
+                )
+                section.add("Report Field Map", field_map, source="Directly Reported")
         else:
             section.add("Axes", None, source="Unknown")
             section.add("Axis Count", None, source="Unknown")
