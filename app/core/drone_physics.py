@@ -59,6 +59,44 @@ from enum import Enum
 
 
 # ---------------------------------------------------------------------------
+# Continuous 360° direction label for velocity vectors
+# ---------------------------------------------------------------------------
+
+# Same 16-sector layout as MotionInterpreter._angle_to_direction().
+# Sector width = 22.5°, centred on the named angle.
+# angle_deg is measured clockwise from the drone's nose (forward = 0°).
+_VEL_SECTORS: tuple[str, ...] = (
+    "Forward",        # 0°
+    "Forward",        # 22.5°
+    "Forward-Right",  # 45°
+    "Forward-Right",  # 67.5°
+    "Right",          # 90°
+    "Right",          # 112.5°
+    "Back-Right",     # 135°
+    "Back-Right",     # 157.5°
+    "Back",           # 180°
+    "Back",           # 202.5°
+    "Back-Left",      # 225°
+    "Back-Left",      # 247.5°
+    "Left",           # 270°
+    "Left",           # 292.5°
+    "Forward-Left",   # 315°
+    "Forward-Left",   # 337.5°
+)
+
+
+def _vel_angle_to_label(angle_deg: float) -> str:
+    """Map a velocity vector angle (CW from drone nose) to a direction label.
+
+    Covers the full 360° with 16 equally-spaced sectors.  Every angle maps
+    to a non-empty label — there are no gaps between directions.
+    """
+    a      = angle_deg % 360.0
+    sector = int((a + 11.25) % 360.0 / 22.5)
+    return _VEL_SECTORS[sector % 16]
+
+
+# ---------------------------------------------------------------------------
 # Tuneable constants
 # ---------------------------------------------------------------------------
 
@@ -283,7 +321,7 @@ class DronePhysics:
             self._target_alt = max(self._target_alt - 0.04, 0.5)
 
     # ------------------------------------------------------------------
-    # Flight dynamics
+    # Flight dynamics — continuous 360° vector movement
     # ------------------------------------------------------------------
 
     def _fly(self, inp: DroneInput, dt: float) -> None:
@@ -301,64 +339,86 @@ class DronePhysics:
         # ── Yaw ─────────────────────────────────────────────────────
         s.yaw = (s.yaw + inp.yaw * max_yaw * dt) % 360.0
 
-        # ── Horizontal velocity target (body-frame → world-frame) ────
-        # inp.pitch > 0 = forward = along the drone's nose direction
-        yaw_rad = math.radians(s.yaw)
-        # Drone nose points in (sin(yaw), 0, -cos(yaw)) world direction
-        fwd_x =  math.sin(yaw_rad)
-        fwd_z = -math.cos(yaw_rad)
-        rgt_x =  math.cos(yaw_rad)
-        rgt_z =  math.sin(yaw_rad)
+        # ── Continuous 360° horizontal velocity ──────────────────────
+        # inp.roll  = x_coord from MotionInterpreter  (-1 = left,   +1 = right)
+        # inp.pitch = y_coord from MotionInterpreter  (-1 = back,   +1 = forward)
+        #
+        # These are already:
+        #   • Calibrated (hardware offset removed)
+        #   • Circular-dead-zoned (no square distortion)
+        #   • Radially rescaled  → magnitude is exact
+        #   • Direction vector is exact unit vector from polar decomposition
+        #
+        # Polar decomposition — no angle snapping or quadrant logic:
+        input_x = inp.roll    # right component  (+1 = full right)
+        input_y = inp.pitch   # forward component (+1 = full forward)
 
-        target_vx = (inp.pitch * fwd_x + inp.roll * rgt_x) * max_spd
-        target_vz = (inp.pitch * fwd_z + inp.roll * rgt_z) * max_spd
+        # Magnitude of the input vector (already clamped [0,1] by MotionInterpreter)
+        input_mag = math.sqrt(input_x * input_x + input_y * input_y)
+        input_mag = min(1.0, input_mag)   # safety clamp
 
-        # Smooth acceleration toward target (snappy = 12, floaty = 4)
-        accel = 12.0 if s.mode == FlightMode.SPORT else 8.0
-        alpha_h = min(dt * accel, 1.0)
-        s.vx += (target_vx - s.vx) * alpha_h
-        s.vz += (target_vz - s.vz) * alpha_h
-
-        # ── Vertical: altitude-hold model ────────────────────────────
-        # Slider 0.5 = hold altitude (0 vertical velocity).
-        # Outside the dead-zone: linear climb/descent rate command.
-        # At 0% slider: MAX_DESCENT_RATE * 0.6 (gentle, not instant)
-        # At 100% slider: MAX_CLIMB_RATE (full climb)
-        slider = inp.throttle   # 0.0 – 1.0
-        deviation = slider - 0.5
-        if abs(deviation) < ALT_HOLD_DZ:
-            # Inside dead-zone: damp vertical velocity to zero quickly
-            s.vy *= max(0.0, 1.0 - DRAG_V * 3.0 * dt)
+        if input_mag > 0.0001:
+            # Unit direction vector (no snapping — exact angle preserved)
+            dir_x = input_x / input_mag   # body-frame right component
+            dir_y = input_y / input_mag   # body-frame forward component
         else:
-            # Scale deviation to climb-rate command
-            # Descent side (deviation < 0): gentler max to prevent fast crashes
-            scale = (abs(deviation) - ALT_HOLD_DZ) / (0.5 - ALT_HOLD_DZ)
-            scale = max(0.0, min(1.0, scale))
-            if deviation > 0:
-                target_vy =  scale * MAX_CLIMB_RATE
-            else:
-                # Cap descent to 30 % of max so 0 % throttle gives a
-                # gentle ~1.2 m/s descent — pilot has 2-3s to react.
-                target_vy = -scale * MAX_DESCENT_RATE * 0.30
-            alpha_v = min(dt * 6.0, 1.0)
-            s.vy += (target_vy - s.vy) * alpha_v
+            dir_x = 0.0
+            dir_y = 0.0
+
+        # Rotate body-frame direction to world-frame using drone heading
+        # Body frame: +X = drone right,   +Y = drone forward
+        # World frame: +X = East,         -Z = North (forward)
+        yaw_rad = math.radians(s.yaw)
+        sin_yaw = math.sin(yaw_rad)
+        cos_yaw = math.cos(yaw_rad)
+
+        # World forward direction: (sin(yaw), 0, -cos(yaw))
+        # World right   direction: (cos(yaw), 0,  sin(yaw))
+        world_vx = (dir_y * sin_yaw + dir_x * cos_yaw) * input_mag * max_spd
+        world_vz = (dir_y * (-cos_yaw) + dir_x * sin_yaw) * input_mag * max_spd
+
+        # ── Smooth acceleration toward target ────────────────────────
+        # Snappier in SPORT, smoother in PRECISION
+        accel = {
+            FlightMode.SPORT:     14.0,
+            FlightMode.PRECISION: 5.0,
+            FlightMode.HOVER:     9.0,
+            FlightMode.ARMED:     9.0,
+        }.get(s.mode, 9.0)
+        alpha = min(dt * accel, 1.0)
+        s.vx += (world_vx - s.vx) * alpha
+        s.vz += (world_vz - s.vz) * alpha
 
         # ── Horizontal drag ──────────────────────────────────────────
-        drag_factor = max(0.0, 1.0 - DRAG_H * dt)
-        if abs(inp.pitch) < 0.02 and abs(inp.roll) < 0.02:
-            # No stick input: brake harder
+        if input_mag < 0.02:
+            # No input → brake harder (3× normal drag)
             s.vx *= max(0.0, 1.0 - DRAG_H * 3.0 * dt)
             s.vz *= max(0.0, 1.0 - DRAG_H * 3.0 * dt)
         else:
-            s.vx *= drag_factor
-            s.vz *= drag_factor
+            factor = max(0.0, 1.0 - DRAG_H * dt)
+            s.vx *= factor
+            s.vz *= factor
 
-        # ── Clamp to speed limits ────────────────────────────────────
-        h_spd = math.sqrt(s.vx ** 2 + s.vz ** 2)
+        # ── Clamp to speed limit ─────────────────────────────────────
+        h_spd = math.sqrt(s.vx * s.vx + s.vz * s.vz)
         if h_spd > max_spd:
             scale = max_spd / h_spd
             s.vx *= scale
             s.vz *= scale
+
+        # ── Vertical: altitude-hold model ────────────────────────────
+        slider     = inp.throttle
+        deviation  = slider - 0.5
+        if abs(deviation) < ALT_HOLD_DZ:
+            s.vy *= max(0.0, 1.0 - DRAG_V * 3.0 * dt)
+        else:
+            scale_v = (abs(deviation) - ALT_HOLD_DZ) / (0.5 - ALT_HOLD_DZ)
+            scale_v = max(0.0, min(1.0, scale_v))
+            if deviation > 0:
+                target_vy =  scale_v * MAX_CLIMB_RATE
+            else:
+                target_vy = -scale_v * MAX_DESCENT_RATE * 0.30
+            s.vy += (target_vy - s.vy) * min(dt * 6.0, 1.0)
         s.vy = max(-MAX_DESCENT_RATE, min(MAX_CLIMB_RATE, s.vy))
 
         # ── Integrate position ───────────────────────────────────────
@@ -366,12 +426,17 @@ class DronePhysics:
         s.y += s.vy * dt
         s.z += s.vz * dt
 
-        # ── Visual tilt (follows velocity for visual feedback) ───────
-        # Pitch: forward velocity → nose down; backward → nose up
-        world_fwd = s.vx * fwd_x + s.vz * fwd_z
-        world_rgt = s.vx * rgt_x + s.vz * rgt_z
-        target_pitch =  world_fwd / max_spd * -TILT_MAX
-        target_roll  = -world_rgt / max_spd *  TILT_MAX
+        # ── Visual tilt (follows actual world velocity, not input) ───
+        # Project world velocity back onto body-frame axes for tilt display
+        fwd_x =  sin_yaw
+        fwd_z = -cos_yaw
+        rgt_x =  cos_yaw
+        rgt_z =  sin_yaw
+        world_fwd_spd = s.vx * fwd_x + s.vz * fwd_z
+        world_rgt_spd = s.vx * rgt_x + s.vz * rgt_z
+        spd_ref = max(max_spd, 0.01)
+        target_pitch =  (world_fwd_spd / spd_ref) * -TILT_MAX
+        target_roll  = -(world_rgt_spd / spd_ref) *  TILT_MAX
         tilt_alpha = min(dt * TILT_SPEED, 1.0)
         s.pitch += (target_pitch - s.pitch) * tilt_alpha
         s.roll  += (target_roll  - s.roll)  * tilt_alpha
@@ -379,12 +444,19 @@ class DronePhysics:
         self._update_command(inp, s)
 
     # ------------------------------------------------------------------
-    # Flight command label
+    # Flight command label — continuous 360° angle, no quadrant snap
     # ------------------------------------------------------------------
 
     def _update_command(self, inp: DroneInput, s: DroneState) -> None:
-        h_moving = math.sqrt(s.vx ** 2 + s.vz ** 2) > 0.4
+        """Derive the human-readable flight command from current velocity.
+
+        Uses the actual world-velocity vector angle (not discrete quadrants)
+        so the label changes smoothly through every intermediate direction,
+        e.g.:  Right → Forward-Right → Forward  as the stick sweeps around.
+        """
+        h_spd    = math.sqrt(s.vx * s.vx + s.vz * s.vz)
         v_moving = abs(s.vy) > 0.15
+        h_moving = h_spd > 0.4
 
         if not h_moving and not v_moving:
             s.flight_command = "Stable Hover" if s.y > 0.1 else "Grounded"
@@ -392,28 +464,34 @@ class DronePhysics:
 
         parts: list[str] = []
 
+        # Vertical component
         if s.vy > 0.15:
             parts.append("Climbing")
         elif s.vy < -0.15:
             parts.append("Descending")
 
+        # Horizontal — derive direction from the actual velocity vector angle
+        # relative to the drone's current heading.
         if h_moving:
             yaw_rad = math.radians(s.yaw)
-            fwd_x =  math.sin(yaw_rad); fwd_z = -math.cos(yaw_rad)
-            rgt_x =  math.cos(yaw_rad); rgt_z =  math.sin(yaw_rad)
-            df = s.vx * fwd_x + s.vz * fwd_z
-            dr = s.vx * rgt_x + s.vz * rgt_z
-            fwd_s = ("Forward"  if df >  0.4
-                     else "Backward" if df < -0.4 else "")
-            rgt_s = ("Right"    if dr >  0.4
-                     else "Left"     if dr < -0.4 else "")
-            if fwd_s and rgt_s:
-                parts.append(f"{fwd_s}-{rgt_s}")
-            elif fwd_s:
-                parts.append(fwd_s)
-            elif rgt_s:
-                parts.append(rgt_s)
+            sin_yaw = math.sin(yaw_rad)
+            cos_yaw = math.cos(yaw_rad)
 
+            # Project world velocity onto body-frame forward/right axes
+            fwd_spd =  s.vx * sin_yaw + s.vz * (-cos_yaw)
+            rgt_spd =  s.vx * cos_yaw + s.vz * sin_yaw
+
+            # Angle of velocity vector in body frame, CW from nose (forward)
+            # atan2(right, forward) → 0°=forward, 90°=right, 180°=back, 270°=left
+            vel_angle = math.degrees(math.atan2(rgt_spd, fwd_spd)) % 360.0
+
+            # Map to direction label using the same 16-sector function
+            # used by MotionInterpreter — labels are perfectly consistent
+            h_label = _vel_angle_to_label(vel_angle)
+            if h_label:
+                parts.append(h_label)
+
+        # Yaw rotation
         if abs(inp.yaw) > 0.15:
             parts.append("Rotating-CW" if inp.yaw > 0 else "Rotating-CCW")
 

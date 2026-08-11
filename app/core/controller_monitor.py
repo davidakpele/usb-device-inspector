@@ -199,6 +199,58 @@ def _find_axis(axes: list[AxisState], hints: tuple[str, ...]) -> AxisState | Non
     return None
 
 
+# ---------------------------------------------------------------------------
+# Continuous 360° direction label
+# ---------------------------------------------------------------------------
+
+# 16 named sectors × 22.5° each covering the complete circle.
+# Sector i spans [i*22.5 - 11.25, i*22.5 + 11.25).
+# Angle is measured clockwise from North (forward = 0°).
+_DIRECTION_SECTORS: list[str] = [
+    "Forward",              # 0°
+    "Forward",              # 22.5°  (same label — narrow sector kept for smoothness)
+    "Forward-Right",        # 45°
+    "Forward-Right",        # 67.5°
+    "Right",                # 90°
+    "Right",                # 112.5°
+    "Back-Right",           # 135°
+    "Back-Right",           # 157.5°
+    "Back",                 # 180°
+    "Back",                 # 202.5°
+    "Back-Left",            # 225°
+    "Back-Left",            # 247.5°
+    "Left",                 # 270°
+    "Left",                 # 292.5°
+    "Forward-Left",         # 315°
+    "Forward-Left",         # 337.5°
+]
+
+
+def _angle_to_direction(angle_deg: float) -> str:
+    """Map a continuous 0-360° angle to a human-readable direction label.
+
+    Uses 16 equal sectors of 22.5° each.  Every degree of the circle maps
+    to exactly one label with no gaps or dead zones between labels.
+
+    Transition example (Right → Forward):
+        91°  → Right
+        89°  → Right
+        68°  → Forward-Right
+        46°  → Forward-Right
+        22°  → Forward
+        1°   → Forward
+
+    All intermediate angles produce valid, distinct labels that change
+    smoothly and continuously as the stick sweeps around.
+    """
+    # Normalise to [0, 360)
+    a = angle_deg % 360.0
+    # Each sector is 22.5° wide; offset by half a sector so sector 0 is
+    # centred on 0° (forward), not starting at 0°.
+    sector = int((a + 11.25) % 360.0 / 22.5)
+    return _DIRECTION_SECTORS[sector % 16]
+
+
 class MotionInterpreter:
     """Converts a list of AxisState values into a MotionState.
 
@@ -280,15 +332,32 @@ class MotionInterpreter:
         return self._calibrated
 
     # ------------------------------------------------------------------
-    # Main interpret
+    # Main interpret  — continuous 360° polar coordinate system
     # ------------------------------------------------------------------
 
     def interpret(self, axes: list[AxisState]) -> MotionState:
+        """Convert raw axis data into a continuous polar MotionState.
+
+        Pipeline
+        --------
+        1. Auto-calibrate resting centre (first _CAL_FRAMES frames)
+        2. Subtract per-axis hardware offset
+        3. Normalise both axes to  −1.0 … +1.0  (centre = 0)
+        4. Compute polar coordinates: magnitude = sqrt(x²+y²)
+        5. Apply CIRCULAR dead-zone on the magnitude (not per-axis)
+           → preserves exact direction even near the edge of the dead-zone
+           → no square dead-zone that distorts diagonals
+        6. Radial rescale: remap [dz, 1] → [0, 1] so a tiny push past the
+           dead-zone gives a tiny response, full throw gives magnitude 1.0
+        7. Reconstruct x_coord / y_coord from direction unit vector × magnitude
+           → no snapping, no quadrant boundaries, perfectly smooth
+        8. Derive the human-readable direction label from the continuous angle
+           using 16 named 22.5°-wide sectors covering the full 360°
+        """
         ms = MotionState()
         if not axes:
             return ms
 
-        # Collect calibration samples during warm-up
         self._update_calibration(axes)
 
         x_ax  = _find_axis(axes, _X_HINTS)
@@ -296,55 +365,69 @@ class MotionInterpreter:
         tw_ax = _find_axis(axes, _TWIST_HINTS)
         th_ax = _find_axis(axes, _THROT_HINTS)
 
-        # ── Calibrated X / Y ────────────────────────────────────────
+        # ── Step 1-2: calibrated percents ───────────────────────────
         x_pct = self._cal_pct(x_ax)
         y_pct = self._cal_pct(y_ax)
 
         ms.x_percent = round(x_pct, 1)
         ms.y_percent = round(y_pct, 1)
 
-        # Normalise to −1.0 … +1.0  (calibrated centre → 0)
-        x_norm = (x_pct - 50.0) / 50.0
-        y_norm = (y_pct - 50.0) / 50.0
+        # ── Step 3: normalise to −1…+1 ──────────────────────────────
+        # x_raw > 0 = right,  y_raw > 0 = stick pushed back
+        x_raw = (x_pct - 50.0) / 50.0
+        y_raw = (y_pct - 50.0) / 50.0
 
-        # Y convention: low raw % = stick pushed forward = positive y_coord
-        y_norm_fwd = -y_norm
+        # Y convention: low raw % = stick pushed forward = positive y
+        y_raw = -y_raw
 
-        dz = self.dead_zone / 50.0   # dead-zone in normalised units
+        # ── Step 4: polar magnitude ──────────────────────────────────
+        raw_mag = math.sqrt(x_raw * x_raw + y_raw * y_raw)
 
-        x_dz = x_norm if abs(x_norm) > dz else 0.0
-        y_dz = y_norm_fwd if abs(y_norm_fwd) > dz else 0.0
+        # ── Step 5: circular dead-zone ───────────────────────────────
+        # Convert dead_zone from "percent of half-range" to normalised units
+        dz = self.dead_zone / 50.0   # e.g. 12 % → 0.24
 
-        ms.x_coord = round(max(-1.0, min(1.0, x_dz)), 3)
-        ms.y_coord = round(max(-1.0, min(1.0, y_dz)), 3)
-
-        # Magnitude and angle
-        magnitude = math.sqrt(x_dz ** 2 + y_dz ** 2)
-        magnitude = min(1.0, magnitude)
-        ms.magnitude = round(magnitude, 3)
-
-        if magnitude > 0.001:
-            angle_deg = math.degrees(math.atan2(x_dz, y_dz))
-            ms.angle_deg = round(angle_deg % 360.0, 1)
+        if raw_mag <= dz:
+            # Inside dead-zone: zero movement, preserve nothing
+            ms.x_coord      = 0.0
+            ms.y_coord      = 0.0
+            ms.magnitude    = 0.0
+            ms.angle_deg    = 0.0
+            ms.direction    = "Center"
+            ms.motion_status = "Stopped"
         else:
-            ms.angle_deg = 0.0
+            # ── Step 6: radial rescale [dz, 1] → [0, 1] ─────────────
+            # This ensures:
+            #   • Barely past dead-zone → very small magnitude
+            #   • Full throw           → magnitude = 1.0
+            #   • Direction is NEVER distorted by the rescaling
+            rescaled_mag = min(1.0, (raw_mag - dz) / (1.0 - dz))
 
-        # ── Direction label ──────────────────────────────────────────
-        h_dir = ("Right" if x_dz > 0 else "Left"    if x_dz < 0 else "")
-        v_dir = ("Forward" if y_dz > 0 else "Back"  if y_dz < 0 else "")
+            # ── Step 7: direction unit vector ────────────────────────
+            # Compute unit vector from raw input (not rescaled — preserves exact angle)
+            unit_x = x_raw / raw_mag
+            unit_y = y_raw / raw_mag
 
-        if v_dir and h_dir:
-            ms.direction = f"{v_dir}-{h_dir}"
-        elif v_dir:
-            ms.direction = v_dir
-        elif h_dir:
-            ms.direction = h_dir
-        else:
-            ms.direction = "Center"
+            # Reconstruct coords: continuous, no snapping
+            ms.x_coord   = round(max(-1.0, min(1.0, unit_x * rescaled_mag)), 4)
+            ms.y_coord   = round(max(-1.0, min(1.0, unit_y * rescaled_mag)), 4)
+            ms.magnitude = round(rescaled_mag, 4)
 
-        ms.motion_status = "Moving" if magnitude > 0.001 else "Stopped"
+            # ── Step 8: continuous angle ─────────────────────────────
+            # atan2(x, y) gives angle clockwise from North (forward):
+            #   0°   = straight forward  (y > 0)
+            #   90°  = right             (x > 0)
+            #   180° = straight back     (y < 0)
+            #   270° = left              (x < 0)
+            angle_rad = math.atan2(unit_x, unit_y)   # CW from +Y (forward)
+            angle_deg = math.degrees(angle_rad) % 360.0
+            ms.angle_deg = round(angle_deg, 2)
 
-        # ── Twist / rudder (calibrated) ──────────────────────────────
+            # Direction label from 16 sectors × 22.5° each, covering 360°
+            ms.direction = _angle_to_direction(angle_deg)
+            ms.motion_status = "Moving"
+
+        # ── Twist / rudder ───────────────────────────────────────────
         if tw_ax:
             tw_pct = self._cal_pct(tw_ax)
             ms.twist_percent = round(tw_pct, 1)
@@ -353,13 +436,11 @@ class MotionInterpreter:
             ms.twist_percent = 50.0
             ms.twist_degrees = 0.0
 
-        # ── Throttle / slider (NOT calibrated — full range intentional) ──
-        # The slider is an absolute control (0 = fully down, 100 = fully up)
-        # so we do NOT subtract a resting offset for it.
+        # ── Throttle (absolute, not calibrated) ──────────────────────
         if th_ax:
             ms.throttle_percent = round(th_ax.percent, 1)
         else:
-            ms.throttle_percent = 50.0    # safe default = hold altitude
+            ms.throttle_percent = 50.0
 
         return ms
 
