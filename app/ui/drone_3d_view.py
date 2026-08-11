@@ -1,113 +1,142 @@
-"""3D QPainter drone renderer — drone_3d_view.py
+"""3D QPainter drone renderer — clarity edition.
 
-Draws the drone world using a custom oblique/isometric projection.
-No OpenGL or third-party 3D library required — pure QPainter.
-
-Projection used:
-  screen_x = world_x * SCALE - world_z * SCALE * 0.5
-  screen_y = -world_y * SCALE + world_z * SCALE * 0.25
-  (origin = centre of widget)
-
-Layers drawn back-to-front:
-  1. Sky gradient background
-  2. Ground grid (receding perspective lines)
-  3. Flight trail (fading polyline)
-  4. Ground shadow (ellipse below drone)
-  5. Drone body (fuselage cross + arm spars)
-  6. Four rotors (spinning ellipses)
-  7. Rotor wash glow (altitude-dependent)
-  8. HUD overlay (altitude, speed, heading compass, mode badge)
-  9. Horizon / attitude indicator (pitch + roll lines)
+Changes from previous version
+------------------------------
+1. Compass rose drawn ON the ground plane with large N/S/E/W labels
+2. Coloured grid axes: X-axis = red (East), Z-axis = blue (North/Forward)
+3. Direction arrow drawn through drone centre showing current heading
+4. Velocity vector arrow (green) showing actual movement direction
+5. Flight command banner — large, centred, colour-coded by direction
+6. Mini top-down map (bottom-right) showing position + heading at all times
+7. Grid coordinate labels every 10 m so you know exact position
+8. Drone nose marker — bright yellow dot on the front of the drone
+9. Status panel: large readable direction text
 """
 from __future__ import annotations
 
 import math
+import random
 from collections import deque
-from typing import Sequence
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import (
-    QColor, QFont, QLinearGradient, QPainter,
-    QPainterPath, QPen, QBrush, QRadialGradient, QPolygonF,
+    QColor, QFont, QLinearGradient,
+    QPainter, QPainterPath, QPen, QBrush,
+    QPolygonF, QRadialGradient,
 )
 from PySide6.QtWidgets import QWidget
 
 from app.core.drone_physics import DroneState, FlightMode
 
 # ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+SCALE     = 65.0    # pixels per metre
+TRAIL_LEN = 200
+
+# Mode colours (R,G,B)
+_MODE_RGB: dict[str, tuple[int,int,int]] = {
+    "DISARMED":  (88,  91, 112),
+    "ARMED":     (250, 179, 135),
+    "HOVER":     (137, 180, 250),
+    "SPORT":     (243, 139, 168),
+    "PRECISION": (166, 227, 161),
+    "LANDING":   (249, 226, 175),
+    "TAKEOFF":   (148, 226, 213),
+}
+
+# Direction banner colours
+_DIR_COLOURS: dict[str, tuple[int,int,int]] = {
+    "Forward":        (166, 227, 161),  # green
+    "Backward":       (243, 139, 168),  # red/pink
+    "Left":           (137, 180, 250),  # blue
+    "Right":          (250, 179, 135),  # orange
+    "Forward-Left":   (148, 226, 213),  # teal
+    "Forward-Right":  (180, 190, 254),  # lavender
+    "Backward-Left":  (249, 226, 175),  # yellow
+    "Backward-Right": (245, 194, 231),  # pink
+    "Climbing":       (166, 227, 161),
+    "Descending":     (243, 139, 168),
+    "Stable Hover":   (137, 180, 250),
+    "Grounded":       (88,  91, 112),
+}
+
+# Pre-built pens — created once, reused every frame
+_PN  = Qt.PenStyle.NoPen
+_PEN_ARM      = QPen(QColor("#CDD6F4"), 4)
+_PEN_BODY     = QPen(QColor("#313244"), 10, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+_PEN_BODY_RIM = QPen(QColor("#89B4FA"), 2)
+_PEN_MOTOR    = QPen(QColor("#89B4FA"), 1)
+_PEN_GRID     = QPen(QColor(68, 71, 90, 90), 1)
+_PEN_GRID_X   = QPen(QColor(243, 139, 168, 100), 1)   # red  = East/West
+_PEN_GRID_Z   = QPen(QColor(137, 180, 250, 100), 1)   # blue = North/South
+_PEN_ALTLINE  = QPen(QColor(137, 180, 250, 60), 1, Qt.PenStyle.DashLine)
+_PEN_VEL      = QPen(QColor(166, 227, 161), 3)         # green velocity arrow
+_PEN_HDG      = QPen(QColor(250, 179, 135), 2)         # orange heading arrow
+_BRUSH_BODY   = QBrush(QColor("#313244"))
+_BRUSH_MOTOR  = QBrush(QColor("#45475A"))
+_LED_F        = QColor("#A6E3A1")   # front green
+_LED_B        = QColor("#F38BA8")   # back  red
+_ROTOR_RGB    = (137, 180, 250)
+
+
+# ---------------------------------------------------------------------------
 # Projection helpers
 # ---------------------------------------------------------------------------
 
-SCALE      = 80.0   # pixels per metre  (was 40 — drone was a speck)
-TRAIL_LEN  = 180    # number of trail points kept
-
-# Mode badge colours
-_MODE_COLOURS: dict[str, str] = {
-    "DISARMED":  "#585B70",
-    "ARMED":     "#FAB387",
-    "HOVER":     "#89B4FA",
-    "SPORT":     "#F38BA8",
-    "PRECISION": "#A6E3A1",
-    "LANDING":   "#F9E2AF",
-    "TAKEOFF":   "#94E2D5",
-}
-
-# Drone arm colours
-_ARM_COLOUR    = QColor("#CDD6F4")
-_ROTOR_COLOUR  = QColor(137, 180, 250, 180)   # #89B4FA semi-transparent
-_BODY_COLOUR   = QColor("#313244")
-_MOTOR_COLOUR  = QColor("#45475A")
-_LED_FRONT     = QColor("#A6E3A1")   # green LEDs front
-_LED_BACK      = QColor("#F38BA8")   # red  LEDs back
+def _proj(wx: float, wy: float, wz: float,
+          cx: float, cy: float,
+          cc: float, sc: float) -> tuple[float, float]:
+    rx =  wx * cc + wz * sc
+    rz = -wx * sc + wz * cc
+    return (cx + rx * SCALE - rz * SCALE * 0.45,
+            cy - wy * SCALE + rz * SCALE * 0.22)
 
 
-def _project(wx: float, wy: float, wz: float,
-             cx: float, cy: float,
-             cam_yaw: float = 0.0) -> tuple[float, float]:
-    """Oblique projection: world (x, y, z) → screen (sx, sy).
-
-    cam_yaw rotates the whole world around Y so the camera can orbit.
-    """
-    rad = math.radians(cam_yaw)
-    rx = wx * math.cos(rad) + wz * math.sin(rad)
-    rz = -wx * math.sin(rad) + wz * math.cos(rad)
-
-    sx = cx + rx * SCALE - rz * SCALE * 0.45
-    sy = cy - wy * SCALE + rz * SCALE * 0.22
-    return sx, sy
-
-
-def _pt(wx: float, wy: float, wz: float,
-        cx: float, cy: float, cam_yaw: float = 0.0) -> QPointF:
-    sx, sy = _project(wx, wy, wz, cx, cy, cam_yaw)
+def _qpt(wx, wy, wz, cx, cy, cc, sc) -> QPointF:
+    sx, sy = _proj(wx, wy, wz, cx, cy, cc, sc)
     return QPointF(sx, sy)
 
+
+def _arrow(p: QPainter, tip: QPointF, base: QPointF,
+           head_len: float = 12, head_w: float = 7) -> None:
+    """Draw a filled arrowhead at tip pointing away from base."""
+    dx = tip.x() - base.x()
+    dy = tip.y() - base.y()
+    length = math.sqrt(dx*dx + dy*dy)
+    if length < 1:
+        return
+    ux, uy = dx / length, dy / length
+    px, py = -uy, ux   # perpendicular
+    p1 = QPointF(tip.x() - ux*head_len + px*head_w,
+                 tip.y() - uy*head_len + py*head_w)
+    p2 = QPointF(tip.x() - ux*head_len - px*head_w,
+                 tip.y() - uy*head_len - py*head_w)
+    poly = QPolygonF([tip, p1, p2])
+    p.setPen(_PN)
+    p.drawPolygon(poly)
+
 # ---------------------------------------------------------------------------
-# Main widget
+# Widget
 # ---------------------------------------------------------------------------
 
 class Drone3DWidget(QWidget):
-    """Pure-QPainter 3D drone visualiser.
-
-    Call ``update_state(state)`` from the simulator every physics frame.
-    Camera auto-follows the drone horizontally; the user can orbit with
-    ``set_camera_yaw(deg)``.
-    """
+    """QPainter 3D drone view with clear directional cues."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._state   = DroneState()
-        self._trail:  deque[tuple[float, float, float]] = deque(maxlen=TRAIL_LEN)
-        self._cam_yaw   = 25.0    # initial 3/4 front-left view
-        self._cam_follow_x = 0.0  # world X the camera is currently centred on
-        self._cam_follow_y = 0.0  # world Y (altitude) — camera rises with drone
-        self._cam_follow_z = 0.0  # world Z depth
+        self._trail: deque[tuple[float,float,float]] = deque(maxlen=TRAIL_LEN)
+        self._cam_yaw = 30.0
+        self._cam_cos = math.cos(math.radians(30.0))
+        self._cam_sin = math.sin(math.radians(30.0))
+        self._fx = self._fy = self._fz = 0.0
+        rng = random.Random(7)
+        self._stars = [(rng.random(), rng.random() * 0.5)
+                       for _ in range(70)]
         self.setMinimumSize(500, 400)
-        self.setStyleSheet("background:#11111B;")
-
-    # ------------------------------------------------------------------
-    # Public
-    # ------------------------------------------------------------------
+        self.setStyleSheet("background:#0D0E1A;")
 
     def update_state(self, state: DroneState) -> None:
         self._state = state
@@ -115,439 +144,551 @@ class Drone3DWidget(QWidget):
             self._trail.append((state.x, state.y, state.z))
         elif state.y < 0.01:
             self._trail.clear()
-
-        # Full 3-axis camera follow so the drone stays centred regardless
-        # of how far it moves horizontally, vertically, or in depth.
-        # Alpha = 0.08 gives smooth lag (~10 frames to close 50 % of the gap).
-        alpha = 0.08
-        self._cam_follow_x += (state.x - self._cam_follow_x) * alpha
-        self._cam_follow_y += (state.y - self._cam_follow_y) * alpha
-        self._cam_follow_z += (state.z - self._cam_follow_z) * alpha
+        a = 0.10
+        self._fx += (state.x - self._fx) * a
+        self._fy += (state.y - self._fy) * a
+        self._fz += (state.z - self._fz) * a
         self.update()
 
     def set_camera_yaw(self, deg: float) -> None:
         self._cam_yaw = deg % 360.0
+        rad = math.radians(self._cam_yaw)
+        self._cam_cos = math.cos(rad)
+        self._cam_sin = math.sin(rad)
         self.update()
 
-    def orbit(self, delta_deg: float) -> None:
-        self._cam_yaw = (self._cam_yaw + delta_deg) % 360.0
-        self.update()
+    def orbit(self, delta: float) -> None:
+        self.set_camera_yaw(self._cam_yaw + delta)
 
     # ------------------------------------------------------------------
     # Paint
     # ------------------------------------------------------------------
 
-    def paintEvent(self, _event) -> None:   # noqa: N802
+    def paintEvent(self, _ev) -> None:          # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
+        cc, sc = self._cam_cos, self._cam_sin
 
-        # Camera origin:
-        #   cx follows the drone's world-X position (side-to-side)
-        #   cy follows both world-Y (altitude) AND world-Z (depth)
-        #   so the drone stays locked in the middle of the screen at
-        #   all times — even when flying high or far away.
-        cx = w / 2.0 - self._cam_follow_x * SCALE * 0.55
-        cy = (h / 2.0 + 80.0
-              - self._cam_follow_y * SCALE           # rise with altitude
-              - self._cam_follow_z * SCALE * 0.15)   # recede with depth
+        # Screen origin — drone centred
+        cx = w * 0.5 - self._fx * SCALE * 0.55
+        cy = h * 0.5 + 80 - self._fy * SCALE - self._fz * SCALE * 0.15
 
-        self._draw_sky(p, w, h)
-        self._draw_ground_grid(p, cx, cy)
-        self._draw_trail(p, cx, cy)
-        self._draw_shadow(p, cx, cy)
-        self._draw_drone(p, cx, cy)
-        self._draw_hud(p, w, h)
+        self._sky(p, w, h)
+        self._ground_compass(p, cx, cy, cc, sc)
+        self._grid(p, cx, cy, cc, sc)
+        self._trail_draw(p, cx, cy, cc, sc)
+        self._shadow(p, cx, cy, cc, sc)
+        self._drone(p, cx, cy, cc, sc)
+        self._velocity_arrow(p, cx, cy, cc, sc)
+        self._hud(p, w, h)
+        self._minimap(p, w, h)
+        self._direction_banner(p, w)
         p.end()
 
     # ------------------------------------------------------------------
     # Sky
     # ------------------------------------------------------------------
 
-    def _draw_sky(self, p: QPainter, w: int, h: int) -> None:
-        grad = QLinearGradient(0, 0, 0, h)
-        grad.setColorAt(0.0,  QColor("#0D0E1A"))   # deep night blue
-        grad.setColorAt(0.55, QColor("#1A1B2E"))
-        grad.setColorAt(0.75, QColor("#2B2D42"))   # horizon haze
-        grad.setColorAt(1.0,  QColor("#181825"))   # ground level
-        p.fillRect(0, 0, w, h, QBrush(grad))
-
-        # Stars (static pattern seeded by position hash)
-        p.setPen(QPen(QColor(255, 255, 255, 60), 1))
-        import random; rng = random.Random(42)
-        for _ in range(80):
-            sx = rng.randint(0, w)
-            sy = rng.randint(0, int(h * 0.55))
-            p.drawPoint(sx, sy)
+    def _sky(self, p: QPainter, w: int, h: int) -> None:
+        g = QLinearGradient(0, 0, 0, h)
+        g.setColorAt(0.0, QColor("#0D0E1A"))
+        g.setColorAt(0.6, QColor("#1A1B2E"))
+        g.setColorAt(0.8, QColor("#252640"))
+        g.setColorAt(1.0, QColor("#181825"))
+        p.fillRect(0, 0, w, h, QBrush(g))
+        p.setPen(QPen(QColor(255, 255, 255, 50), 1))
+        for fx, fy in self._stars:
+            p.drawPoint(int(fx * w), int(fy * h))
 
     # ------------------------------------------------------------------
-    # Ground grid
+    # Ground compass — large N/S/E/W labels ON the ground plane
     # ------------------------------------------------------------------
 
-    def _draw_ground_grid(self, p: QPainter, cx: float, cy: float) -> None:
-        s = self._state
-        GRID = 2.0      # grid spacing metres
-        HALF = 14       # half-grid lines each side
+    def _ground_compass(self, p: QPainter, cx, cy, cc, sc) -> None:
+        s   = self._state
+        R   = 8.0   # compass radius in metres
 
-        grid_pen = QPen(QColor(68, 71, 90, 120), 1)   # #45475A dim
-        axis_pen = QPen(QColor(137, 180, 250, 80), 1)
+        # Four cardinal directions in world space
+        dirs = [
+            ("N", 0, -R, QColor(166, 227, 161)),   # North = -Z = green
+            ("S", 0,  R, QColor(243, 139, 168)),   # South = +Z = red
+            ("E", R,  0, QColor(250, 179, 135)),   # East  = +X = orange
+            ("W",-R,  0, QColor(137, 180, 250)),   # West  = -X = blue
+        ]
 
-        # Snap grid origin to drone X/Z so the ground scrolls with drone
-        orig_x = round(s.x / GRID) * GRID
-        orig_z = round(s.z / GRID) * GRID
+        f = QFont("Segoe UI", 10, QFont.Weight.Bold)
+        p.setFont(f)
 
-        for i in range(-HALF, HALF + 1):
-            is_axis = (i == 0)
-            p.setPen(axis_pen if is_axis else grid_pen)
+        for lbl, dx, dz, col in dirs:
+            sx, sy = _proj(s.x + dx, 0, s.z + dz, cx, cy, cc, sc)
+            # Background circle
+            p.setBrush(QBrush(QColor(col.red(), col.green(), col.blue(), 160)))
+            p.setPen(_PN)
+            p.drawEllipse(QPointF(sx, sy), 14, 9)
+            # Label
+            p.setPen(QPen(QColor("#0D0E1A")))
+            p.drawText(int(sx)-14, int(sy)-9, 28, 18,
+                       Qt.AlignmentFlag.AlignCenter, lbl)
 
-            # Lines parallel to X axis (Z-varying)
-            wz = orig_z + i * GRID
-            p1 = _pt(orig_x - HALF * GRID, 0, wz, cx, cy, self._cam_yaw)
-            p2 = _pt(orig_x + HALF * GRID, 0, wz, cx, cy, self._cam_yaw)
-            p.drawLine(p1, p2)
-
-            # Lines parallel to Z axis (X-varying)
-            wx = orig_x + i * GRID
-            p3 = _pt(wx, 0, orig_z - HALF * GRID, cx, cy, self._cam_yaw)
-            p4 = _pt(wx, 0, orig_z + HALF * GRID, cx, cy, self._cam_yaw)
-            p.drawLine(p3, p4)
+        # Heading ray from drone (orange line showing which way drone faces)
+        yr  = math.radians(s.yaw)
+        # Drone nose is in +X * sin(yaw) - Z * cos(yaw) direction
+        nx  = s.x + math.sin(yr) * 4.0
+        nz  = s.z - math.cos(yr) * 4.0
+        p.setPen(QPen(QColor(250, 179, 135, 180), 2))
+        p.drawLine(_qpt(s.x, 0, s.z, cx, cy, cc, sc),
+                   _qpt(nx,  0, nz,  cx, cy, cc, sc))
 
     # ------------------------------------------------------------------
-    # Flight trail
+    # Grid with coloured axes and coordinate labels
     # ------------------------------------------------------------------
 
-    def _draw_trail(self, p: QPainter, cx: float, cy: float) -> None:
+    def _grid(self, p: QPainter, cx, cy, cc, sc) -> None:
+        s   = self._state
+        GAP = 2.0
+        N   = 14
+        ox  = round(s.x / GAP) * GAP
+        oz  = round(s.z / GAP) * GAP
+
+        for i in range(-N, N + 1):
+            # Z-parallel lines (East-West direction) = Red tint
+            wz = oz + i * GAP
+            if abs(wz - oz) < 0.01:
+                p.setPen(_PEN_GRID_X)
+            else:
+                p.setPen(_PEN_GRID)
+            p.drawLine(_qpt(ox - N*GAP, 0, wz, cx, cy, cc, sc),
+                       _qpt(ox + N*GAP, 0, wz, cx, cy, cc, sc))
+
+            # X-parallel lines (North-South direction) = Blue tint
+            wx = ox + i * GAP
+            if abs(wx - ox) < 0.01:
+                p.setPen(_PEN_GRID_Z)
+            else:
+                p.setPen(_PEN_GRID)
+            p.drawLine(_qpt(wx, 0, oz - N*GAP, cx, cy, cc, sc),
+                       _qpt(wx, 0, oz + N*GAP, cx, cy, cc, sc))
+
+        # Coordinate labels every 10 m
+        p.setFont(QFont("Consolas", 7))
+        for d in (-10, -5, 0, 5, 10):
+            wx = round((s.x + d) / 5) * 5
+            sx, sy = _proj(wx, 0, oz, cx, cy, cc, sc)
+            p.setPen(QPen(QColor(137, 180, 250, 120)))
+            p.drawText(int(sx)-12, int(sy)+2, 24, 12,
+                       Qt.AlignmentFlag.AlignCenter, f"{int(wx)}")
+            wz = round((s.z + d) / 5) * 5
+            sx, sy = _proj(ox, 0, wz, cx, cy, cc, sc)
+            p.setPen(QPen(QColor(243, 139, 168, 120)))
+            p.drawText(int(sx)+3, int(sy)-6, 24, 12,
+                       Qt.AlignmentFlag.AlignLeft, f"{int(wz)}")
+
+    # ------------------------------------------------------------------
+    # Trail
+    # ------------------------------------------------------------------
+
+    def _trail_draw(self, p, cx, cy, cc, sc) -> None:
         trail = list(self._trail)
         n = len(trail)
         if n < 2:
             return
         for i in range(1, n):
-            alpha = int(200 * i / n)
-            pen = QPen(QColor(166, 227, 161, alpha), 2)   # #A6E3A1
-            p.setPen(pen)
-            a = _pt(*trail[i - 1], cx, cy, self._cam_yaw)
-            b = _pt(*trail[i],     cx, cy, self._cam_yaw)
-            p.drawLine(a, b)
+            a = int(220 * i / n)
+            p.setPen(QPen(QColor(166, 227, 161, a), 2))
+            ax, ay = _proj(*trail[i-1], cx, cy, cc, sc)
+            bx, by = _proj(*trail[i],   cx, cy, cc, sc)
+            p.drawLine(QPointF(ax, ay), QPointF(bx, by))
 
     # ------------------------------------------------------------------
-    # Ground shadow
+    # Shadow
     # ------------------------------------------------------------------
 
-    def _draw_shadow(self, p: QPainter, cx: float, cy: float) -> None:
+    def _shadow(self, p, cx, cy, cc, sc) -> None:
         s = self._state
-        if s.y < 0.05:
+        if s.y < 0.1:
             return
-        # Shadow on ground (y=0) — grows fainter with altitude
-        alpha = max(0, int(140 - s.y * 8))
+        alpha = max(0, int(150 - s.y * 7))
         if alpha <= 0:
             return
-        sx, sy = _project(s.x, 0, s.z, cx, cy, self._cam_yaw)
-        radius_x = int(max(8, 40 - s.y * 2))
-        radius_y = int(radius_x * 0.35)
-        p.setPen(Qt.PenStyle.NoPen)
+        sx, sy = _proj(s.x, 0, s.z, cx, cy, cc, sc)
+        rx = max(6, int(44 - s.y * 1.5))
+        p.setPen(_PN)
         p.setBrush(QBrush(QColor(0, 0, 0, alpha)))
-        p.drawEllipse(QPointF(sx, sy), radius_x, radius_y)
+        p.drawEllipse(QPointF(sx, sy), rx, int(rx * 0.32))
 
     # ------------------------------------------------------------------
-    # Drone body
+    # Drone
     # ------------------------------------------------------------------
 
-    def _draw_drone(self, p: QPainter, cx: float, cy: float) -> None:
-        s = self._state
-        dy = s.y   # world altitude
+    def _drone(self, p, cx, cy, cc, sc) -> None:
+        s   = self._state
+        ARM = 0.44
+        yr  = math.radians(s.yaw)
+        pr  = math.radians(s.pitch)
+        rr  = math.radians(s.roll)
+        cyr, syr = math.cos(yr), math.sin(yr)
+        cpr, spr = math.cos(pr), math.sin(pr)
+        crr, srr = math.cos(rr), math.sin(rr)
 
-        # Drone body axes in local frame (before pitch/roll/yaw)
-        ARM = 0.45    # arm length metres  (was 0.35 — now clearly visible)
-        yaw_r   = math.radians(s.yaw)
-        pitch_r = math.radians(s.pitch)
-        roll_r  = math.radians(s.roll)
+        def b2w(bx, by, bz):
+            # Roll → Pitch → Yaw
+            # Roll (around body Z)
+            cx2 =  bx*crr - by*srr;  cy2 =  bx*srr + by*crr
+            # Pitch (around body X)
+            dx  =  cx2;               dy2 =  cy2*cpr - bz*spr; dz = cy2*spr + bz*cpr
+            # Yaw (around world Y) — convention: forward = (sin(yaw), 0, -cos(yaw))
+            # ex = dx*cyr - dz*syr  (NOT dx*cyr + dz*syr)
+            ex  =  dx*cyr - dz*syr;   ez  =  dx*syr + dz*cyr
+            return ex + s.x, dy2 + s.y, ez + s.z
 
-        # Motor positions in body frame (X=right, Z=back)
-        motors_body = [
-            ( ARM,  0,  ARM),   # front-right
-            (-ARM,  0,  ARM),   # front-left
-            (-ARM,  0, -ARM),   # back-left
-            ( ARM,  0, -ARM),   # back-right
-        ]
+        motors = [b2w( ARM, 0, -ARM),   # FR — front-right  (Z=-ARM = NORTH = forward)
+                  b2w(-ARM, 0, -ARM),   # FL — front-left
+                  b2w(-ARM, 0,  ARM),   # BL — back-left   (Z=+ARM = SOUTH = backward)
+                  b2w( ARM, 0,  ARM)]   # BR — back-right
 
-        # Rotate body frame → world frame
-        def body_to_world(bx: float, by: float, bz: float) -> tuple[float, float, float]:
-            # Roll (around Z axis in body)
-            cx2 =  bx * math.cos(roll_r) - by * math.sin(roll_r)
-            cy2 =  bx * math.sin(roll_r) + by * math.cos(roll_r)
-            cz2 = bz
-            # Pitch (around X axis in body)
-            dx = cx2
-            dy2 =  cy2 * math.cos(pitch_r) - cz2 * math.sin(pitch_r)
-            dz =   cy2 * math.sin(pitch_r) + cz2 * math.cos(pitch_r)
-            # Yaw (around Y axis in world)
-            ex =  dx * math.cos(yaw_r) + dz * math.sin(yaw_r)
-            ey =  dy2
-            ez = -dx * math.sin(yaw_r) + dz * math.cos(yaw_r)
-            return ex + s.x, ey + dy, ez + s.z
+        def wp(wx, wy, wz): return _qpt(wx, wy, wz, cx, cy, cc, sc)
+        cpt = wp(s.x, s.y, s.z)
 
-        motor_world = [body_to_world(*m) for m in motors_body]
+        # Arms
+        p.setPen(_PEN_ARM)
+        for m in motors:
+            p.drawLine(cpt, wp(*m))
 
-        # Centre world point
-        cx_w = s.x
-        cy_w = dy
-        cz_w = s.z
+        # Body pillar
+        p.setPen(_PEN_BODY)
+        p.drawLine(wp(*b2w(0,-0.07,0)), wp(*b2w(0, 0.14,0)))
+        p.setBrush(_BRUSH_BODY)
+        p.setPen(_PEN_BODY_RIM)
+        p.drawEllipse(cpt, 15, 9)
 
-        def wp(wx, wy, wz):
-            return _pt(wx, wy, wz, cx, cy, self._cam_yaw)
+        # Motor pods
+        p.setBrush(_BRUSH_MOTOR); p.setPen(_PEN_MOTOR)
+        for m in motors:
+            p.drawEllipse(wp(*m), 8, 5)
 
-        centre_pt = wp(cx_w, cy_w, cz_w)
+        # Rotors
+        if s.rotor_speed > 0.02:
+            self._rotors(p, cx, cy, cc, sc, motors, s)
 
-        # ── Arms ─────────────────────────────────────────────────────
-        p.setPen(QPen(_ARM_COLOUR, 4))
-        for mx, my, mz in motor_world:
-            p.drawLine(centre_pt, wp(mx, my, mz))
+        # LEDs — front green, back red
+        if s.mode != FlightMode.DISARMED:
+            la = 220 if s.rotor_speed > 0.1 else 80
+            for i, m in enumerate(motors):
+                base = _LED_F if i < 2 else _LED_B
+                p.setBrush(QBrush(QColor(base.red(),base.green(),base.blue(),la)))
+                p.setPen(_PN)
+                p.drawEllipse(wp(*m), 5, 3)
 
-        # ── Body fuselage ────────────────────────────────────────────
-        body_top    = body_to_world(0,  0.14, 0)
-        body_bottom = body_to_world(0, -0.07, 0)
-        p.setPen(QPen(_BODY_COLOUR, 10, Qt.PenStyle.SolidLine,
-                      Qt.PenCapStyle.RoundCap))
-        p.drawLine(wp(*body_bottom), wp(*body_top))
+        # NOSE marker — computed directly from heading angle so it ALWAYS
+        # matches the orange heading arrow drawn on the ground.
+        # sin(yaw) = East component, -cos(yaw) = North component (same as heading arrow).
+        nose_dist = ARM * 1.1
+        nose_wx = s.x + math.sin(yr) * nose_dist
+        nose_wy = s.y
+        nose_wz = s.z - math.cos(yr) * nose_dist
+        p.setBrush(QBrush(QColor(249, 226, 175, 230)))
+        p.setPen(QPen(QColor("#0D0E1A"), 1))
+        p.drawEllipse(wp(nose_wx, nose_wy, nose_wz), 6, 4)
+        # Label "FWD" near nose
+        nsx, nsy = _proj(nose_wx, nose_wy, nose_wz, cx, cy, cc, sc)
+        p.setPen(QPen(QColor(249, 226, 175)))
+        p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        p.drawText(int(nsx)-12, int(nsy)-14, 24, 12,
+                   Qt.AlignmentFlag.AlignCenter, "FWD")
 
-        p.setBrush(QBrush(_BODY_COLOUR))
-        p.setPen(QPen(QColor("#89B4FA"), 2))
-        p.drawEllipse(centre_pt, 16, 10)
+        # Altitude dashed line to ground
+        if s.y > 0.4:
+            p.setPen(_PEN_ALTLINE)
+            p.drawLine(wp(s.x, 0, s.z), cpt)
 
-        # ── Motor pods ───────────────────────────────────────────────
-        p.setBrush(QBrush(_MOTOR_COLOUR))
-        p.setPen(QPen(QColor("#89B4FA"), 1))
-        for mx, my, mz in motor_world:
-            p.drawEllipse(wp(mx, my, mz), 8, 5)
+        # Rotor wash glow
+        if s.rotor_speed > 0.18 and s.y > 0.3:
+            ga = int(s.rotor_speed * 55)
+            glow = QRadialGradient(cpt, 72)
+            r, g, b = _ROTOR_RGB
+            glow.setColorAt(0.0, QColor(r,g,b,ga)); glow.setColorAt(1.0, QColor(r,g,b,0))
+            p.setBrush(QBrush(glow)); p.setPen(_PN)
+            p.drawEllipse(cpt, 72, 28)
 
-        # ── Rotors ───────────────────────────────────────────────────
-        self._draw_rotors(p, cx, cy, motor_world, s)
+    def _rotors(self, p, cx, cy, cc, sc, motors, s: DroneState) -> None:
+        R     = 0.34
+        alpha = min(210, int(s.rotor_speed * 210))
+        r, g, b = _ROTOR_RGB
+        dc    = QColor(r, g, b, alpha)
+        bp    = QPen(QColor(205, 214, 244, min(alpha+40, 255)), 2)
+        for i, (mx, my, mz) in enumerate(motors):
+            mp  = _qpt(mx, my, mz, cx, cy, cc, sc)
+            ang = s.rotor_angles[i]
+            pts = [_qpt(mx+math.cos(math.radians(ang+k*45))*R, my,
+                        mz+math.sin(math.radians(ang+k*45))*R, cx, cy, cc, sc)
+                   for k in range(8)]
+            p.setBrush(QBrush(dc))
+            p.setPen(QPen(QColor(r,g,b,min(alpha,180)),1))
+            p.drawPolygon(QPolygonF(pts))
+            p.setPen(bp)
+            for a_off in (ang, ang+180):
+                ar = math.radians(a_off)
+                p.drawLine(mp, _qpt(mx+math.cos(ar)*R, my,
+                                    mz+math.sin(ar)*R, cx, cy, cc, sc))
 
-        # ── LEDs ─────────────────────────────────────────────────────
-        if s.mode.value != "DISARMED":
-            led_alpha = 220 if s.rotor_speed > 0.1 else 100
-            for i, (mx, my, mz) in enumerate(motor_world):
-                colour = _LED_FRONT if i < 2 else _LED_BACK
-                colour = QColor(colour.red(), colour.green(),
-                                colour.blue(), led_alpha)
-                p.setBrush(QBrush(colour))
-                p.setPen(Qt.PenStyle.NoPen)
-                p.drawEllipse(wp(mx, my, mz), 5, 3)
+    # ------------------------------------------------------------------
+    # Velocity vector arrow — shows actual movement direction
+    # ------------------------------------------------------------------
 
-        # ── Altitude line (vertical line from ground to drone) ───────
-        if s.y > 0.3:
-            alt_pen = QPen(QColor(137, 180, 250, 60), 1,
-                           Qt.PenStyle.DashLine)
-            p.setPen(alt_pen)
-            ground_pt = wp(s.x, 0.0, s.z)
-            p.drawLine(ground_pt, centre_pt)
-
-        # ── Rotor wash / glow ────────────────────────────────────────
-        if s.rotor_speed > 0.15 and s.y > 0.2:
-            glow_alpha = int(s.rotor_speed * 60)
-            glow = QRadialGradient(centre_pt, 75)
-            glow.setColorAt(0.0, QColor(137, 180, 250, glow_alpha))
-            glow.setColorAt(1.0, QColor(137, 180, 250, 0))
-            p.setBrush(QBrush(glow))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawEllipse(centre_pt, 75, 28)
-
-    def _draw_rotors(self, p: QPainter, cx: float, cy: float,
-                     motor_world: list[tuple[float, float, float]],
-                     s: DroneState) -> None:
-        """Draw spinning rotor discs — ellipses tilted with pitch/roll."""
-        if s.rotor_speed < 0.02:
+    def _velocity_arrow(self, p, cx, cy, cc, sc) -> None:
+        s    = self._state
+        spd  = s.speed_h
+        if spd < 0.3:
             return
-        alpha = min(220, int(s.rotor_speed * 220))
-        ROTOR_R = 0.36   # rotor disc radius metres  (was 0.28)
+        scale = min(3.0, spd / 2.0)   # arrow length scales with speed
 
-        for i, (mx, my, mz) in enumerate(motor_world):
-            mp = _pt(mx, my, mz, cx, cy, self._cam_yaw)
+        # World velocity direction
+        vlen = math.sqrt(s.vx**2 + s.vz**2)
+        if vlen < 0.01:
+            return
+        uvx, uvz = s.vx / vlen, s.vz / vlen
 
-            # Ellipse axes in screen space (project 4 rim points)
-            angle = s.rotor_angles[i]
-            rim_pts = []
-            for a in range(0, 360, 45):
-                rad = math.radians(a + angle)
-                rx = math.cos(rad) * ROTOR_R
-                rz = math.sin(rad) * ROTOR_R
-                rim_pts.append(_pt(mx + rx, my, mz + rz,
-                                   cx, cy, self._cam_yaw))
+        # Arrow tip in world space
+        tx  = s.x + uvx * scale
+        tz  = s.z + uvz * scale
 
-            # Draw rotor disc as polygon
-            poly = QPolygonF(rim_pts)
-            colour = QColor(_ROTOR_COLOUR.red(), _ROTOR_COLOUR.green(),
-                            _ROTOR_COLOUR.blue(), alpha)
-            p.setBrush(QBrush(colour))
-            p.setPen(QPen(QColor(137, 180, 250, min(alpha, 180)), 1))
-            p.drawPolygon(poly)
+        base_pt = _qpt(s.x, s.y, s.z, cx, cy, cc, sc)
+        tip_pt  = _qpt(tx,  s.y, tz,  cx, cy, cc, sc)
 
-            # Blade lines (2 blades visible)
-            blade_pen = QPen(QColor(205, 214, 244, min(alpha + 30, 255)), 2)
-            p.setPen(blade_pen)
-            for a in (angle, angle + 180):
-                rad = math.radians(a)
-                bx = math.cos(rad) * ROTOR_R
-                bz = math.sin(rad) * ROTOR_R
-                p.drawLine(mp, _pt(mx + bx, my, mz + bz,
-                                   cx, cy, self._cam_yaw))
+        p.setPen(_PEN_VEL)
+        p.drawLine(base_pt, tip_pt)
+        p.setBrush(QBrush(QColor(166, 227, 161)))
+        _arrow(p, tip_pt, base_pt, head_len=10, head_w=6)
+
+        # Speed label near tip
+        p.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        p.setPen(QPen(QColor(166, 227, 161)))
+        p.drawText(int(tip_pt.x())+4, int(tip_pt.y())-6, 50, 14,
+                   Qt.AlignmentFlag.AlignLeft, f"{spd:.1f}m/s")
 
     # ------------------------------------------------------------------
-    # HUD overlay
+    # Direction banner — large centred text below mode badge
     # ------------------------------------------------------------------
 
-    def _draw_hud(self, p: QPainter, w: int, h: int) -> None:
+    def _direction_banner(self, p: QPainter, w: int) -> None:
+        s   = self._state
+        cmd = s.flight_command
+        if not cmd or cmd in ("Disarmed — press Button 1 to ARM",):
+            return
+
+        # Get colour for this command
+        rgb = (88, 91, 112)
+        for key, col in _DIR_COLOURS.items():
+            if key.lower() in cmd.lower():
+                rgb = col
+                break
+
+        r, g, b = rgb
+        f = QFont("Segoe UI", 16, QFont.Weight.Bold)
+        p.setFont(f)
+        fm    = p.fontMetrics()
+        tw    = fm.horizontalAdvance(cmd)
+        bw    = tw + 24
+        bh    = fm.height() + 10
+        bx    = (w - bw) // 2
+        by    = 52   # below mode badge
+
+        p.setBrush(QBrush(QColor(r, g, b, 200)))
+        p.setPen(_PN)
+        p.drawRoundedRect(bx, by, bw, bh, 8, 8)
+        p.setPen(QPen(QColor("#0D0E1A")))
+        p.drawText(bx, by, bw, bh, Qt.AlignmentFlag.AlignCenter, cmd)
+
+    # ------------------------------------------------------------------
+    # HUD top strip
+    # ------------------------------------------------------------------
+
+    def _hud(self, p: QPainter, w: int, h: int) -> None:
         s = self._state
+        self._hud_mode_badge(p, w, s)
+        self._hud_telem(p, s)
+        self._hud_compass(p, w, s)
+        self._hud_attitude(p, h, s)
+        self._hud_bars(p, w, h, s)
 
-        # ── Mode badge (top centre) ──────────────────────────────────
-        mode_str  = s.mode.value
-        mode_col  = QColor(_MODE_COLOURS.get(mode_str, "#585B70"))
-        badge_txt = f"  {mode_str}  "
-        f_badge = QFont("Segoe UI", 11, QFont.Weight.Bold)
-        p.setFont(f_badge)
-        fm = p.fontMetrics()
-        bw = fm.horizontalAdvance(badge_txt) + 10
-        bh = fm.height() + 6
-        bx = (w - bw) // 2
-        by = 12
-
-        p.setBrush(QBrush(QColor(mode_col.red(), mode_col.green(),
-                                  mode_col.blue(), 200)))
-        p.setPen(Qt.PenStyle.NoPen)
+    def _hud_mode_badge(self, p, w, s: DroneState) -> None:
+        mode  = s.mode.value
+        rgb   = _MODE_RGB.get(mode, (88,91,112))
+        text  = f"  {mode}  "
+        f     = QFont("Segoe UI", 11, QFont.Weight.Bold)
+        p.setFont(f)
+        fm    = p.fontMetrics()
+        bw    = fm.horizontalAdvance(text) + 10
+        bh    = fm.height() + 6
+        bx    = (w - bw) // 2
+        by    = 10
+        p.setBrush(QBrush(QColor(*rgb, 210)))
+        p.setPen(_PN)
         p.drawRoundedRect(bx, by, bw, bh, 5, 5)
-        p.setPen(QPen(QColor("#11111B")))
-        p.drawText(bx, by, bw, bh, Qt.AlignmentFlag.AlignCenter, badge_txt)
+        p.setPen(QPen(QColor("#0D0E1A")))
+        p.drawText(bx, by, bw, bh, Qt.AlignmentFlag.AlignCenter, text)
 
-        # ── Flight command (below badge) ─────────────────────────────
-        f_cmd = QFont("Segoe UI", 10)
-        p.setFont(f_cmd)
-        p.setPen(QPen(QColor("#CDD6F4")))
-        p.drawText(0, by + bh + 4, w, 22,
-                   Qt.AlignmentFlag.AlignHCenter, s.flight_command)
-
-        # ── Telemetry strip (top-left) ───────────────────────────────
-        self._draw_telem_strip(p, s)
-
-        # ── Compass rose (top-right) ─────────────────────────────────
-        self._draw_compass(p, w, s)
-
-        # ── Attitude indicator (bottom-left) ─────────────────────────
-        self._draw_attitude(p, h, s)
-
-        # ── Altitude / speed bars (bottom-right) ─────────────────────
-        self._draw_bars(p, w, h, s)
-
-    def _draw_telem_strip(self, p: QPainter, s: DroneState) -> None:
+    def _hud_telem(self, p, s: DroneState) -> None:
         lines = [
-            ("ALT",  f"{s.altitude:6.1f} m"),
+            ("ALT",   f"{s.altitude:6.1f} m"),
             ("H-SPD", f"{s.speed_h:5.1f} m/s"),
             ("V-SPD", f"{s.speed_v:+5.1f} m/s"),
-            ("THR",  f"{s.throttle * 100:4.0f} %"),
-            ("HDG",  f"{s.heading:5.1f}°"),
-            ("DIST", f"{s.total_distance:6.1f} m"),
+            ("HDG",   f"{s.heading:5.1f}°"),
+            ("X",     f"{s.x:6.1f} m"),
+            ("Z",     f"{s.z:6.1f} m"),
         ]
         p.setFont(QFont("Consolas", 10))
-        x, y = 10, 14
-        for label, value in lines:
+        x, y = 8, 12
+        for lbl, val in lines:
             p.setPen(QPen(QColor("#585B70")))
-            p.drawText(x, y, 52, 18, Qt.AlignmentFlag.AlignRight, label)
+            p.drawText(x, y, 48, 18, Qt.AlignmentFlag.AlignRight, lbl)
             p.setPen(QPen(QColor("#CDD6F4")))
-            p.drawText(x + 56, y, 80, 18, Qt.AlignmentFlag.AlignLeft, value)
+            p.drawText(x+52, y, 90, 18, Qt.AlignmentFlag.AlignLeft, val)
             y += 19
 
-    def _draw_compass(self, p: QPainter, w: int, s: DroneState) -> None:
-        cx, cy, r = w - 52, 52, 38
-        # Background
-        p.setBrush(QBrush(QColor(17, 17, 27, 180)))
-        p.setPen(QPen(QColor("#45475A"), 1))
-        p.drawEllipse(QPointF(cx, cy), r, r)
-        # Cardinal labels
-        p.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
-        for label, angle in (("N", 0), ("E", 90), ("S", 180), ("W", 270)):
-            rad = math.radians(angle - s.heading)
-            lx = cx + (r - 10) * math.sin(rad)
-            ly = cy - (r - 10) * math.cos(rad)
-            p.setPen(QPen(QColor("#A6E3A1") if label == "N"
-                         else QColor("#A6ADC8")))
-            p.drawText(int(lx) - 6, int(ly) - 6, 12, 12,
-                       Qt.AlignmentFlag.AlignCenter, label)
+    def _hud_compass(self, p, w, s: DroneState) -> None:
+        cx, cy, r = w-52, 52, 38
+        p.setBrush(QBrush(QColor(13,14,26,200)))
+        p.setPen(QPen(QColor("#45475A"),1))
+        p.drawEllipse(QPointF(cx,cy), r, r)
+        p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        for lbl, ang, col in (
+            ("N", 0,   QColor("#A6E3A1")),
+            ("E", 90,  QColor(250,179,135)),
+            ("S", 180, QColor(243,139,168)),
+            ("W", 270, QColor(137,180,250)),
+        ):
+            rad = math.radians(ang - s.heading)
+            lx  = cx + (r-11)*math.sin(rad)
+            ly  = cy - (r-11)*math.cos(rad)
+            p.setPen(QPen(col))
+            p.drawText(int(lx)-7,int(ly)-7,14,14, Qt.AlignmentFlag.AlignCenter, lbl)
         # Heading needle
-        p.setPen(QPen(QColor("#F38BA8"), 2))
-        p.setBrush(QBrush(QColor("#F38BA8")))
-        tip = QPointF(cx, cy - r + 8)
-        p.drawLine(QPointF(cx, cy), tip)
-        p.drawEllipse(tip, 3, 3)
-        # Centre dot
-        p.setBrush(QBrush(QColor("#CDD6F4")))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(QPointF(cx, cy), 3, 3)
+        rad = math.radians(-s.heading)
+        tip = QPointF(cx + (r-6)*math.sin(0), cy - (r-6)*math.cos(0))
+        p.setPen(QPen(QColor("#F38BA8"),2))
+        p.drawLine(QPointF(cx,cy), tip)
+        p.setBrush(QBrush(QColor("#CDD6F4"))); p.setPen(_PN)
+        p.drawEllipse(QPointF(cx,cy), 3, 3)
+        # HDG text
+        p.setPen(QPen(QColor("#CDD6F4")))
+        p.setFont(QFont("Consolas", 8))
+        p.drawText(int(cx)-18, int(cy)+r+2, 36, 12,
+                   Qt.AlignmentFlag.AlignCenter, f"{s.heading:.0f}°")
 
-    def _draw_attitude(self, p: QPainter, h: int, s: DroneState) -> None:
-        cx, cy, r = 52, h - 60, 38
-        # Background split sky/ground
-        p.setClipRect(int(cx - r), int(cy - r), r * 2, r * 2)
-        # Sky
-        p.setBrush(QBrush(QColor(13, 71, 161, 160)))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(QPointF(cx, cy), r, r)
-        # Ground horizon shift by pitch
-        pitch_off = s.pitch * (r / 45.0)
-        roll_rad  = math.radians(-s.roll)
-        # Rotated horizon line
-        cos_r = math.cos(roll_rad)
-        sin_r = math.sin(roll_rad)
-        p.setBrush(QBrush(QColor(95, 56, 28, 160)))
+    def _hud_attitude(self, p, h, s: DroneState) -> None:
+        cx, cy, r = 52, h-62, 38
+        p.setClipRect(int(cx-r), int(cy-r), r*2, r*2)
+        p.setBrush(QBrush(QColor(13,71,161,160))); p.setPen(_PN)
+        p.drawEllipse(QPointF(cx,cy), r, r)
+        po  = s.pitch * (r/50.0)
+        rr  = math.radians(-s.roll)
+        cr, sr = math.cos(rr), math.sin(rr)
         path = QPainterPath()
-        hx1 = cx - r * cos_r - pitch_off * sin_r
-        hy1 = cy - r * sin_r + pitch_off * cos_r  # type: ignore[assignment]
-        hx2 = cx + r * cos_r + pitch_off * sin_r
-        hy2 = cy + r * sin_r - pitch_off * cos_r  # type: ignore[assignment]
-        path.moveTo(hx1, hy1)
-        path.lineTo(hx2, hy2)
-        path.lineTo(cx + r, cy + r)
-        path.lineTo(cx - r, cy + r)
+        hx1 = cx - r*cr - po*sr; hy1 = cy - r*sr + po*cr
+        hx2 = cx + r*cr + po*sr; hy2 = cy + r*sr - po*cr
+        path.moveTo(hx1,hy1); path.lineTo(hx2,hy2)
+        path.lineTo(cx+r, cy+r); path.lineTo(cx-r, cy+r)
         path.closeSubpath()
-        p.drawPath(path)
+        p.setBrush(QBrush(QColor(95,56,28,160))); p.drawPath(path)
         p.setClipping(False)
-        # Rim
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor("#45475A"), 2))
-        p.drawEllipse(QPointF(cx, cy), r, r)
-        # Centre cross
-        p.setPen(QPen(QColor("#FAB387"), 2))
-        p.drawLine(int(cx) - 10, int(cy), int(cx) - 4, int(cy))
-        p.drawLine(int(cx) + 4,  int(cy), int(cx) + 10, int(cy))
-        p.drawLine(int(cx), int(cy) - 4, int(cx), int(cy) + 4)
+        p.setPen(QPen(QColor("#45475A"),2))
+        p.drawEllipse(QPointF(cx,cy), r, r)
+        p.setPen(QPen(QColor("#FAB387"),2))
+        p.drawLine(int(cx)-10,int(cy), int(cx)-4,int(cy))
+        p.drawLine(int(cx)+4, int(cy), int(cx)+10,int(cy))
+        p.drawLine(int(cx),int(cy)-4, int(cx),int(cy)+4)
 
-    def _draw_bars(self, p: QPainter, w: int, h: int,
-                   s: DroneState) -> None:
-        """Altitude and throttle vertical bars (bottom-right)."""
-        bar_h = 100
-        bar_w = 14
-        by = h - bar_h - 14
-        # Altitude bar (max 30 m)
-        self._vert_bar(p, w - 38, by, bar_w, bar_h,
-                       s.altitude / 30.0, QColor("#89B4FA"), "ALT")
-        # Throttle bar
-        self._vert_bar(p, w - 18, by, bar_w, bar_h,
-                       s.throttle, QColor("#A6E3A1"), "THR")
+    def _hud_bars(self, p, w, h, s: DroneState) -> None:
+        bh = 100; bw = 12; by = h - bh - 12
+        self._vbar(p, w-34, by, bw, bh, s.altitude/30.0, QColor("#89B4FA"), "ALT")
+        self._vbar(p, w-18, by, bw, bh, s.throttle,      QColor("#A6E3A1"), "THR")
 
-    def _vert_bar(self, p: QPainter, x: int, y: int,
-                  bw: int, bh: int, frac: float,
-                  colour: QColor, label: str) -> None:
+    def _vbar(self, p, x, y, bw, bh, frac, col, lbl) -> None:
         frac = max(0.0, min(1.0, frac))
-        # Background
-        p.setBrush(QBrush(QColor(17, 17, 27, 180)))
-        p.setPen(QPen(QColor("#45475A"), 1))
+        p.setBrush(QBrush(QColor(13,14,26,190)))
+        p.setPen(QPen(QColor("#45475A"),1))
         p.drawRect(x, y, bw, bh)
-        # Fill
-        fill_h = int(bh * frac)
-        if fill_h > 0:
-            p.setBrush(QBrush(colour))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawRect(x + 1, y + bh - fill_h, bw - 2, fill_h)
-        # Label
+        fh = int(bh * frac)
+        if fh > 0:
+            p.setBrush(QBrush(col)); p.setPen(_PN)
+            p.drawRect(x+1, y+bh-fh, bw-2, fh)
         p.setPen(QPen(QColor("#A6ADC8")))
         p.setFont(QFont("Consolas", 7))
-        p.drawText(x - 2, y + bh + 2, bw + 4, 12,
-                   Qt.AlignmentFlag.AlignCenter, label)
+        p.drawText(x-2, y+bh+2, bw+4, 12, Qt.AlignmentFlag.AlignCenter, lbl)
+
+    # ------------------------------------------------------------------
+    # Mini top-down map (bottom-right)
+    # Shows position, heading, trail and N/S/E/W labels
+    # ------------------------------------------------------------------
+
+    def _minimap(self, p: QPainter, w: int, h: int) -> None:
+        s     = self._state
+        MR    = 70      # map radius px
+        MSCALE= 4.5     # px per metre in minimap
+        mx    = w - MR - 8
+        my    = h - MR - 8
+
+        # Background
+        p.setBrush(QBrush(QColor(13, 14, 26, 200)))
+        p.setPen(QPen(QColor("#45475A"), 1))
+        p.drawEllipse(QPointF(mx, my), MR, MR)
+
+        # Grid lines
+        p.setPen(QPen(QColor(68, 71, 90, 80), 1))
+        for offset in (-20, -10, 0, 10, 20):
+            ox = mx + offset * MSCALE / 10
+            oy = my + offset * MSCALE / 10
+            p.drawLine(QPointF(ox, my - MR + 4), QPointF(ox, my + MR - 4))
+            p.drawLine(QPointF(mx - MR + 4, oy), QPointF(mx + MR - 4, oy))
+
+        # Cardinal labels
+        p.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        for lbl, dx, dy, col in (
+            ("N", 0, -1, QColor("#A6E3A1")),
+            ("S", 0,  1, QColor(243,139,168)),
+            ("E", 1,  0, QColor(250,179,135)),
+            ("W",-1,  0, QColor(137,180,250)),
+        ):
+            p.setPen(QPen(col))
+            lx = mx + dx * (MR - 8)
+            ly = my + dy * (MR - 8)
+            p.drawText(int(lx)-6, int(ly)-6, 12, 12,
+                       Qt.AlignmentFlag.AlignCenter, lbl)
+
+        # Trail dots
+        p.setClipRect(int(mx-MR), int(my-MR), MR*2, MR*2)
+        trail = list(self._trail)
+        n = len(trail)
+        for i, (tx, ty_alt, tz) in enumerate(trail):
+            a  = int(160 * i / max(n, 1))
+            rx = mx + (tx - s.x) * MSCALE
+            ry = my + (tz - s.z) * MSCALE
+            p.setBrush(QBrush(QColor(166, 227, 161, a)))
+            p.setPen(_PN)
+            p.drawEllipse(QPointF(rx, ry), 2, 2)
+
+        # Drone position dot
+        p.setBrush(QBrush(QColor("#89B4FA")))
+        p.setPen(QPen(QColor("#CDD6F4"), 1))
+        p.drawEllipse(QPointF(mx, my), 5, 5)
+
+        # Heading arrow
+        yr = math.radians(s.yaw)
+        ax = mx + math.sin(yr) * 14
+        ay = my - math.cos(yr) * 14
+        p.setPen(QPen(QColor(250, 179, 135), 2))
+        p.drawLine(QPointF(mx, my), QPointF(ax, ay))
+        p.setBrush(QBrush(QColor(250,179,135)))
+        _arrow(p, QPointF(ax, ay), QPointF(mx, my), head_len=6, head_w=4)
+
+        p.setClipping(False)
+
+        # Position text below map
+        p.setPen(QPen(QColor("#585B70")))
+        p.setFont(QFont("Consolas", 7))
+        p.drawText(int(mx-MR), int(my+MR+2), MR*2, 12,
+                   Qt.AlignmentFlag.AlignCenter,
+                   f"X:{s.x:.1f} Z:{s.z:.1f}")

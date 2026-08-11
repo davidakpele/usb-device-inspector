@@ -41,6 +41,7 @@ from app.core.controller_monitor import (
 from app.core.drone_physics import DroneInput, DronePhysics, FlightMode
 from app.models.usb_device import USBDevice
 from app.ui.drone_3d_view import Drone3DWidget
+from app.utils.flight_logger import FlightLogger
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -92,11 +93,11 @@ _MODE_STYLE: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 _AXIS_MAP = [
-    ("X Axis",          "Roll        (left ← / right →)"),
-    ("Y Axis",          "Pitch       (forward ↑ / back ↓)"),
-    ("Rz (Z Rotation)", "Yaw / Spin  (rotate CCW / CW)"),
-    ("Slider",          "Throttle    (down = 0 % / up = 100 %)"),
-    ("Hat N/S",         "Altitude trim  (nudge ±)"),
+    ("X Axis",          "Roll       (left ← / right →)"),
+    ("Y Axis",          "Pitch      (forward ↑ / back ↓)"),
+    ("Rz (Z Rotation)", "Yaw / Spin (rotate CCW ↺ / CW ↻)"),
+    ("Slider",          "Altitude   (50 % = hold  ↑ climb  ↓ descend)"),
+    ("Hat N/S",         "Altitude trim  (fine adjust)"),
 ]
 
 _BTN_MAP = [
@@ -160,6 +161,12 @@ class DroneSimulatorWindow(QWidget):
         self._sim_start   = time.monotonic()
         self._last_step   = time.monotonic()
 
+        # Markdown flight logger — records everything to a .md file
+        self._flight_logger = FlightLogger(
+            device_name=device.name or device.device_id
+        )
+        self._calibrated_logged = False   # log calibration data once
+
         self.setWindowTitle(
             f"🚁  Drone Simulator — {device.name or device.device_id}")
         self.resize(1280, 760)
@@ -172,6 +179,12 @@ class DroneSimulatorWindow(QWidget):
         self._start_monitor(axis_bit_sizes, field_map)
         self._start_timer()
         self._log("Simulator ready.  Press Button 1 to ARM.")
+        self._flight_logger.log_event(
+            "INFO",
+            f"Session started — controller: **{device.name or device.device_id}**  "
+            f"VID:{device.vendor_id or '?'} PID:{device.product_id or '?'}"
+        )
+        self._log(f"📄 Log: {self._flight_logger.path}")
 
     # ------------------------------------------------------------------
     # UI construction
@@ -298,6 +311,12 @@ class DroneSimulatorWindow(QWidget):
             "color:#FAB387; font-size:10px;")
         glayout.addWidget(self._guide_mode_lbl)
 
+        # Calibration status
+        self._cal_status_lbl = QLabel("⏳ Calibrating axes…")
+        self._cal_status_lbl.setWordWrap(True)
+        self._cal_status_lbl.setStyleSheet("color:#585B70; font-size:9px;")
+        glayout.addWidget(self._cal_status_lbl)
+
         glayout.addWidget(self._hline())
 
         # Live axis indicators
@@ -368,7 +387,11 @@ class DroneSimulatorWindow(QWidget):
 
         # Quick-start tip
         tip = QLabel(
-            "Tip: Arm → push\nthrottle > 46 %\nto lift off")
+            "Slider 50% = hold alt\n"
+            "> 50% = climb\n"
+            "< 50% = descend\n\n"
+            "ARM → Btn 7 (auto\n"
+            "take-off to 3 m)")
         tip.setStyleSheet("color:#585B70; font-size:9px;")
         tip.setWordWrap(True)
         glayout.addWidget(tip)
@@ -520,7 +543,10 @@ class DroneSimulatorWindow(QWidget):
 
     def _start_timer(self) -> None:
         self._timer = QTimer(self)
-        self._timer.setInterval(1000 // self._PHYSICS_HZ)
+        # 16 ms = ~60 Hz. PreciseTimer reduces OS timer jitter so physics
+        # steps are more uniform and control response feels tighter.
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._timer.setInterval(16)
         self._timer.timeout.connect(self._physics_tick)
         self._timer.start()
 
@@ -529,6 +555,10 @@ class DroneSimulatorWindow(QWidget):
         now  = time.monotonic()
         dt   = min(now - self._last_step, 0.05)
         self._last_step = now
+
+        # Advance logger clock FIRST so log_input and log_state
+        # both see the same tick value this frame.
+        self._flight_logger.tick()
 
         inp, btns_now = self._build_drone_input()
         state = self._physics.step(inp, dt)
@@ -544,8 +574,12 @@ class DroneSimulatorWindow(QWidget):
     def _build_drone_input(self) -> tuple[DroneInput, dict[int, bool]]:
         """Build a DroneInput from the latest controller state.
 
-        Returns (DroneInput, btns_now) so the caller can update the guide
-        panel button lights without duplicating the button-state read.
+        Mapping to the altitude-hold physics model
+        ------------------------------------------
+        inp.pitch > 0  → FORWARD   (no sign inversion — y_coord>0 = forward)
+        inp.throttle   → 0.5 = hold altitude, >0.5 = climb, <0.5 = descend
+                         Direct pass-through of 0-1 slider value.
+                         The physics engine handles the hold dead-zone.
         """
         s = self._last_input_state
         inp = DroneInput()
@@ -555,17 +589,22 @@ class DroneSimulatorWindow(QWidget):
             m = s.motion
 
             # ── Axes ────────────────────────────────────────────────
+            # Roll: right → positive (bank right)
             inp.roll  =  m.x_coord
-            inp.pitch = -m.y_coord
 
-            # Yaw — 10 % dead-zone around centre
+            # Pitch: y_coord > 0 = forward (MotionInterpreter convention)
+            # Physics: pitch > 0 = FORWARD — same sign, no inversion needed
+            inp.pitch =  m.y_coord
+
+            # Yaw: twist CW = positive, 8 % dead-zone
             twist_raw = (m.twist_percent - 50.0) / 50.0
-            inp.yaw = twist_raw if abs(twist_raw) > 0.10 else 0.0
+            inp.yaw   = twist_raw if abs(twist_raw) > 0.08 else 0.0
 
-            # ── Throttle ─────────────────────────────────────────────
-            # Slider 0-100 % → 0.0-1.0. Dead-zone < 5 % = zero thrust.
-            raw_thr = m.throttle_percent / 100.0
-            inp.throttle = raw_thr if raw_thr >= 0.05 else 0.0
+            # ── Throttle (altitude-hold model) ───────────────────────
+            # Pass 0-1 directly. Physics dead-zone ±0.08 around 0.5
+            # makes 0.5 = "hold altitude." No floor dead-zone here —
+            # that was causing instant crashes at idle slider position.
+            inp.throttle = m.throttle_percent / 100.0
 
             # ── Buttons — rising-edge only ───────────────────────────
             btns_now = {b.index: b.pressed for b in s.buttons}
@@ -603,11 +642,42 @@ class DroneSimulatorWindow(QWidget):
         self._ctrl_status.setText("● Live")
         self._ctrl_status.setStyleSheet("color:#A6E3A1; font-weight:bold;")
 
+        # Check calibration completion (fires once)
+        if not self._calibrated_logged and hasattr(self, "_monitor"):
+            decoder = getattr(self._monitor, "_decoder", None)
+            if decoder:
+                interp = getattr(decoder, "_interpreter", None)
+                if interp and interp.is_calibrated():
+                    offsets = interp.get_calibration_info()
+                    self._calibrated_logged = True
+                    self._flight_logger.log_calibration(offsets, frames_used=60)
+                    # Build calibration summary for UI
+                    lines = []
+                    for ax, off in sorted(offsets.items()):
+                        if abs(off) > 0.5:
+                            short = ax.split()[0] if " " in ax else ax
+                            lines.append(f"{short}: {off:+.1f}%")
+                    summary = "  ".join(lines) if lines else "all centred"
+                    self._cal_status_lbl.setText(f"✓ Cal: {summary}")
+                    self._cal_status_lbl.setStyleSheet(
+                        "color:#A6E3A1; font-size:9px;")
+                    self._log(f"📐 Calibrated — offsets: {summary}")
+                    # Log raw vs calibrated axis snapshot
+                    axes_raw = {ax.name: ax.percent
+                                for ax in state.axes}
+                    self._flight_logger.log_axis_diagnostic(
+                        axes_raw=axes_raw,
+                        axes_cal={ax: round(50.0 + (axes_raw.get(ax, 50.0)
+                                   - (50.0 + off)), 2)
+                                  for ax, off in offsets.items()},
+                    )
+
     @Slot(str)
     def _on_monitor_error(self, msg: str) -> None:
         self._ctrl_status.setText("● No signal")
         self._ctrl_status.setStyleSheet("color:#EF5350; font-weight:bold;")
         self._log(f"⚠  Controller: {msg}")
+        self._flight_logger.log_error("ControllerMonitor", msg)
 
     # ------------------------------------------------------------------
     # UI state updates
@@ -635,30 +705,47 @@ class DroneSimulatorWindow(QWidget):
             self._mode_lbl.setText(mode)
             self._mode_lbl.setStyleSheet(_MODE_STYLE.get(mode, ""))
             self._log(f"▶  Mode changed → {mode}")
+            self._flight_logger.log_event("MODE",
+                f"Mode changed: **{self._prev_mode or 'INIT'}** → **{mode}**")
             self._prev_mode = mode
             self._update_guide_instructions(mode)
 
         if cmd != self._prev_cmd:
             self._cmd_lbl.setText(cmd)
-            if cmd not in ("Grounded", "Idle", "Stable Hover"):
+            if cmd not in ("Grounded", "Idle", "Stable Hover",
+                           "Disarmed — press Button 1 to ARM"):
                 self._log(f"✈  {cmd}")
+                self._flight_logger.log_event("COMMAND", cmd)
             self._prev_cmd = cmd
+
+        # Per-second telemetry snapshot to MD log
+        self._flight_logger.log_state(
+            mode=mode, command=cmd,
+            altitude=state.altitude, speed_h=state.speed_h,
+            speed_v=state.speed_v,  heading=state.heading,
+            pitch=state.pitch,      roll=state.roll,
+            x=state.x,              z=state.z,
+            flight_time=state.flight_time,
+        )
 
     def _update_guide_instructions(self, mode: str) -> None:
         """Update the guide panel's mode-specific instruction text."""
         instructions = {
             "DISARMED":  "Click ARM or press Button 1 to arm the drone.",
-            "ARMED":     "Push Throttle (Slider) above 46 % to lift off.\n"
-                         "Press Button 7 or 🚀 for auto take-off.",
-            "HOVER":     "Stick: Forward / Back / Left / Right.\n"
-                         "Rz twist = Yaw (rotate).\n"
-                         "Throttle controls altitude.",
-            "SPORT":     "⚡ SPORT: 14 m/s max speed.\n"
+            "ARMED":     "Press Button 7 or 🚀 for auto take-off.\n\n"
+                         "Or: move Slider above 50 % to climb manually.",
+            "HOVER":     "Stick forward/back/left/right to fly.\n"
+                         "Twist = Yaw (rotate).\n"
+                         "Slider 50 % = hold altitude.\n"
+                         "Above 50 % = climb, below = descend.",
+            "SPORT":     "⚡ SPORT: up to 18 m/s.\n"
                          "Same controls as HOVER.",
-            "PRECISION": "🎯 PRECISION: 2.5 m/s max.\n"
-                         "Ultra-fine control for close manoeuvres.",
-            "TAKEOFF":   "⬆ Auto-climbing to hover altitude…",
-            "LANDING":   "⬇ Auto-landing — keep clear.",
+            "PRECISION": "🎯 PRECISION: max 3 m/s.\n"
+                         "For close-in manoeuvres.",
+            "TAKEOFF":   "⬆ Auto-climbing to 3 m…\n"
+                         "Hands off — will enter HOVER.",
+            "LANDING":   "⬇ Auto-landing in progress…\n"
+                         "Keep clear.",
         }
         text = instructions.get(mode, "")
         self._guide_mode_lbl.setText(text)
@@ -674,25 +761,26 @@ class DroneSimulatorWindow(QWidget):
 
     def _update_guide_inputs(self, inp: DroneInput,
                              btns_now: dict[int, bool]) -> None:
-        """Update live axis bars and button indicator lights."""
-        # Axis bars: range 0-200, centre=100 for roll/pitch/yaw;
-        # throttle is 0-200 where 200 = full up.
+        """Update live axis bars, button lights, and write input log row."""
         bars = self._axis_bars
-        bars["roll"] .setValue(int((inp.roll  + 1.0) * 100))   # -1..+1 → 0..200
-        bars["pitch"].setValue(int((-inp.pitch + 1.0) * 100))  # inverted for display
-        bars["yaw"]  .setValue(int((inp.yaw   + 1.0) * 100))
-        bars["thr"]  .setValue(int(inp.throttle * 200))        # 0..1 → 0..200
 
-        # Colour: blue for centre, green when active
+        # Roll / Pitch / Yaw: -1..+1 → 0..200 (centre = 100)
+        bars["roll"] .setValue(int((inp.roll  + 1.0) * 100))
+        bars["pitch"].setValue(int((inp.pitch + 1.0) * 100))
+        bars["yaw"]  .setValue(int((inp.yaw   + 1.0) * 100))
+        bars["thr"]  .setValue(int(inp.throttle * 200))
+
+        # Colour: blue when near centre, green when actively deflected
         for key, bar in bars.items():
-            v = bar.value()
-            active = abs(v - 100) > 15 if key != "thr" else v > 20
+            v      = bar.value()
+            active = (abs(v - 100) > 20 if key == "thr"
+                      else abs(v - 100) > 15)
             colour = "#A6E3A1" if active else "#89B4FA"
             bar.setStyleSheet(
                 f"QProgressBar{{background:#313244;border:none;border-radius:2px;}}"
                 f"QProgressBar::chunk{{background:{colour};border-radius:2px;}}")
 
-        # Button lights in guide panel
+        # Guide button lights
         for idx, lbl in self._guide_btn_labels.items():
             pressed = btns_now.get(idx, False)
             if pressed:
@@ -704,7 +792,7 @@ class DroneSimulatorWindow(QWidget):
                     "background:#1E1E2E; color:#585B70; border:1px solid #313244;"
                     "border-radius:3px; font-size:9px;")
 
-        # Also update the right-panel control mapping labels
+        # Right-panel control mapping labels
         for idx, lbl in self._btn_map_labels.items():
             if btns_now.get(idx, False):
                 lbl.setStyleSheet(
@@ -714,6 +802,24 @@ class DroneSimulatorWindow(QWidget):
                 colour = _BTN_MAP[idx - 1][2] if idx <= len(_BTN_MAP) else "#CDD6F4"
                 lbl.setStyleSheet(f"color:{colour};")
 
+        # Log button presses (each press = one event line)
+        for idx, pressed in btns_now.items():
+            if pressed and not self._btn_prev.get(idx, False):
+                btn_name = _BTN_MAP[idx - 1][1] if idx <= len(_BTN_MAP) else f"Btn {idx}"
+                self._flight_logger.log_event(
+                    "BUTTON", f"Button **{idx}** pressed — {btn_name}")
+
+        # Sample raw input row to MD log (logger handles 1 Hz decimation)
+        m = self._last_input_state.motion if self._last_input_state else None
+        self._flight_logger.log_input(
+            roll=inp.roll, pitch=inp.pitch, yaw=inp.yaw,
+            throttle=inp.throttle,
+            x_coord=inp.roll,    y_coord=inp.pitch,
+            twist_pct=m.twist_percent if m else 50.0,
+            thr_pct=m.throttle_percent if m else 50.0,
+            btns_pressed=[i for i, v in btns_now.items() if v],
+        )
+
     # ------------------------------------------------------------------
     # Manual button handlers (on-screen buttons)
     # ------------------------------------------------------------------
@@ -722,26 +828,25 @@ class DroneSimulatorWindow(QWidget):
         """Inject a single ARM pulse directly into the physics engine."""
         inp = DroneInput()
         inp.btn_arm = True
-        # Also carry through current throttle so the drone doesn't get
-        # zero-throttle on this frame if the slider is up.
+        # Use current slider position; default to 0.5 (hold altitude)
         if self._last_input_state:
-            raw_thr = self._last_input_state.motion.throttle_percent / 100.0
-            inp.throttle = raw_thr if raw_thr >= 0.05 else 0.0
+            inp.throttle = self._last_input_state.motion.throttle_percent / 100.0
+        else:
+            inp.throttle = 0.5
         self._physics.step(inp, 1 / self._PHYSICS_HZ)
 
     def _on_land_click(self) -> None:
         """Inject a single LAND pulse."""
         inp = DroneInput()
         inp.btn_land = True
-        if self._last_input_state:
-            raw_thr = self._last_input_state.motion.throttle_percent / 100.0
-            inp.throttle = raw_thr if raw_thr >= 0.05 else 0.0
+        inp.throttle = 0.5
         self._physics.step(inp, 1 / self._PHYSICS_HZ)
 
     def _on_takeoff_click(self) -> None:
         """Inject a single TAKEOFF pulse."""
         inp = DroneInput()
         inp.btn_takeoff = True
+        inp.throttle = 0.5
         self._physics.step(inp, 1 / self._PHYSICS_HZ)
 
     # ------------------------------------------------------------------
@@ -781,16 +886,20 @@ class DroneSimulatorWindow(QWidget):
             from app.core.drone_physics import DroneInput as _DI
             di = DroneInput(); di.btn_arm = True
             self._physics.step(di, 0.016)
+            self._flight_logger.log_event("BUTTON", "Keyboard Space → ARM/DISARM")
 
         elif key == Qt.Key.Key_T:
             di = DroneInput(); di.btn_takeoff = True
             self._physics.step(di, 0.016)
+            self._flight_logger.log_event("TAKEOFF", "Keyboard T → TAKEOFF")
         elif key == Qt.Key.Key_L:
             di = DroneInput(); di.btn_land = True
             self._physics.step(di, 0.016)
+            self._flight_logger.log_event("LAND", "Keyboard L → LAND")
         elif key == Qt.Key.Key_H:
             di = DroneInput(); di.btn_hover = True
             self._physics.step(di, 0.016)
+            self._flight_logger.log_event("MODE", "Keyboard H → HOVER toggle")
 
         # Camera orbit
         elif key == Qt.Key.Key_Left:
@@ -808,4 +917,6 @@ class DroneSimulatorWindow(QWidget):
         self._timer.stop()
         if hasattr(self, "_monitor") and self._monitor.isRunning():
             self._monitor.stop()
+        self._flight_logger.log_event("INFO", "Simulator window closed")
+        self._flight_logger.close()
         event.accept()

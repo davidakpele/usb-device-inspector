@@ -202,61 +202,116 @@ def _find_axis(axes: list[AxisState], hints: tuple[str, ...]) -> AxisState | Non
 class MotionInterpreter:
     """Converts a list of AxisState values into a MotionState.
 
-    Dead-zone: any axis within ``dead_zone`` percent of centre (50.0) is
-    treated as zero movement on that axis.  Default 15 % gives comfortable
-    centre-release without false triggers.
+    Auto-calibration
+    ----------------
+    The first ``_CAL_FRAMES`` input reports are used to measure the actual
+    resting centre of each axis.  For the WingMan Extreme Digital 3D, X rests
+    at 58.4 % instead of 50 %, which without calibration produces a permanent
+    +0.167 roll input — causing the drone to circle endlessly.
 
-    Direction vocabulary
-    --------------------
-    The primary stick (X/Y axes) maps to 8 directions + Center:
-      Y < dead  → Forward   (stick pushed away from player)
-      Y > dead  → Back      (stick pulled toward player)
-      X < dead  → Left
-      X > dead  → Right
-    Diagonals are "Forward-Left" etc.
-    When both axes are inside the dead-zone → Center.
+    After calibration the interpreter subtracts the measured offset before
+    applying the dead-zone, so "hands-off" always produces (0, 0).
 
-    Motion status
-    -------------
-    "Moving"  — magnitude > dead_zone as fraction of full throw
-    "Stopped" — magnitude ≤ dead_zone (stick effectively at rest)
+    Dead-zone
+    ---------
+    Applied AFTER offset subtraction.  Default 12 % gives a comfortable
+    centre-release zone without swallowing small deliberate inputs.
 
-    Coordinates
-    -----------
-    x_coord / y_coord are normalised to −1.0 … +1.0 with dead-zone
-    applied (values inside dead-zone collapse to 0.0).
-    angle_deg is measured clockwise from north (forward = 0°).
+    Axis conventions (after calibration + dead-zone)
+    ------------------------------------------------
+    x_coord  > 0  →  Right
+    x_coord  < 0  →  Left
+    y_coord  > 0  →  Forward   (Y axis is inverted: low raw % = forward)
+    y_coord  < 0  →  Backward
     """
 
-    def __init__(self, dead_zone: float = 15.0) -> None:
-        self.dead_zone = dead_zone       # percent from centre (0-50)
+    _CAL_FRAMES = 60   # number of frames to average for centre measurement
+
+    def __init__(self, dead_zone: float = 12.0) -> None:
+        self.dead_zone = dead_zone          # percent of half-range
+
+        # Per-axis calibration offsets (key = axis name lower, value = offset %)
+        # Offset = (measured_rest_percent - 50.0)
+        # Applied as: adjusted_pct = raw_pct - offset
+        self._cal_offsets: dict[str, float] = {}
+        self._cal_samples: dict[str, list[float]] = {}
+        self._calibrated = False
+        self._cal_frame  = 0
+
+    # ------------------------------------------------------------------
+    # Calibration
+    # ------------------------------------------------------------------
+
+    def _update_calibration(self, axes: list[AxisState]) -> None:
+        """Collect samples during the first _CAL_FRAMES frames."""
+        if self._calibrated:
+            return
+
+        for ax in axes:
+            key = ax.name.lower()
+            if key not in self._cal_samples:
+                self._cal_samples[key] = []
+            self._cal_samples[key].append(ax.percent)
+
+        self._cal_frame += 1
+        if self._cal_frame >= self._CAL_FRAMES:
+            # Compute average resting position for each axis.
+            # Offset = average - 50.0  (positive means resting right of centre)
+            for key, samples in self._cal_samples.items():
+                avg = sum(samples) / len(samples)
+                offset = avg - 50.0
+                # Only apply the offset if it's meaningful (> 2 %) to avoid
+                # correcting a properly-centred axis with noise.
+                self._cal_offsets[key] = offset if abs(offset) > 2.0 else 0.0
+            self._calibrated = True
+
+    def reset_calibration(self) -> None:
+        """Force a fresh calibration cycle (call when controller reconnects)."""
+        self._cal_offsets  = {}
+        self._cal_samples  = {}
+        self._calibrated   = False
+        self._cal_frame    = 0
+
+    def get_calibration_info(self) -> dict[str, float]:
+        """Return measured offsets for diagnostics / logging."""
+        return dict(self._cal_offsets)
+
+    def is_calibrated(self) -> bool:
+        return self._calibrated
+
+    # ------------------------------------------------------------------
+    # Main interpret
+    # ------------------------------------------------------------------
 
     def interpret(self, axes: list[AxisState]) -> MotionState:
         ms = MotionState()
         if not axes:
             return ms
 
+        # Collect calibration samples during warm-up
+        self._update_calibration(axes)
+
         x_ax  = _find_axis(axes, _X_HINTS)
         y_ax  = _find_axis(axes, _Y_HINTS)
         tw_ax = _find_axis(axes, _TWIST_HINTS)
         th_ax = _find_axis(axes, _THROT_HINTS)
 
-        # ── X / Y stick ─────────────────────────────────────────────
-        x_pct = x_ax.percent if x_ax else 50.0
-        y_pct = y_ax.percent if y_ax else 50.0
+        # ── Calibrated X / Y ────────────────────────────────────────
+        x_pct = self._cal_pct(x_ax)
+        y_pct = self._cal_pct(y_ax)
 
         ms.x_percent = round(x_pct, 1)
         ms.y_percent = round(y_pct, 1)
 
-        # Normalise to −1.0 … +1.0 (centre = 0)
+        # Normalise to −1.0 … +1.0  (calibrated centre → 0)
         x_norm = (x_pct - 50.0) / 50.0
-        y_norm = (y_pct - 50.0) / 50.0    # positive = stick pulled back
-        # Convention: positive Y_coord = Forward (invert raw Y)
+        y_norm = (y_pct - 50.0) / 50.0
+
+        # Y convention: low raw % = stick pushed forward = positive y_coord
         y_norm_fwd = -y_norm
 
-        dz = self.dead_zone / 50.0         # dead-zone in normalised units
+        dz = self.dead_zone / 50.0   # dead-zone in normalised units
 
-        # Apply dead-zone
         x_dz = x_norm if abs(x_norm) > dz else 0.0
         y_dz = y_norm_fwd if abs(y_norm_fwd) > dz else 0.0
 
@@ -268,29 +323,15 @@ class MotionInterpreter:
         magnitude = min(1.0, magnitude)
         ms.magnitude = round(magnitude, 3)
 
-        # Angle: atan2(x, y_forward) gives clockwise-from-north
         if magnitude > 0.001:
-            angle_rad = math.atan2(x_dz, y_dz)
-            angle_deg = math.degrees(angle_rad)
-            if angle_deg < 0:
-                angle_deg += 360.0
-            ms.angle_deg = round(angle_deg, 1)
+            angle_deg = math.degrees(math.atan2(x_dz, y_dz))
+            ms.angle_deg = round(angle_deg % 360.0, 1)
         else:
             ms.angle_deg = 0.0
 
         # ── Direction label ──────────────────────────────────────────
-        h_dir = ""   # horizontal component
-        v_dir = ""   # vertical component
-
-        if x_dz > 0:
-            h_dir = "Right"
-        elif x_dz < 0:
-            h_dir = "Left"
-
-        if y_dz > 0:
-            v_dir = "Forward"
-        elif y_dz < 0:
-            v_dir = "Back"
+        h_dir = ("Right" if x_dz > 0 else "Left"    if x_dz < 0 else "")
+        v_dir = ("Forward" if y_dz > 0 else "Back"  if y_dz < 0 else "")
 
         if v_dir and h_dir:
             ms.direction = f"{v_dir}-{h_dir}"
@@ -301,24 +342,40 @@ class MotionInterpreter:
         else:
             ms.direction = "Center"
 
-        # ── Motion status ────────────────────────────────────────────
         ms.motion_status = "Moving" if magnitude > 0.001 else "Stopped"
 
-        # ── Twist / rudder ───────────────────────────────────────────
+        # ── Twist / rudder (calibrated) ──────────────────────────────
         if tw_ax:
-            ms.twist_percent = round(tw_ax.percent, 1)
-            ms.twist_degrees = round(tw_ax.degrees, 1)
+            tw_pct = self._cal_pct(tw_ax)
+            ms.twist_percent = round(tw_pct, 1)
+            ms.twist_degrees = round(tw_pct / 100.0 * 359.9, 1)
         else:
             ms.twist_percent = 50.0
             ms.twist_degrees = 0.0
 
-        # ── Throttle / slider ────────────────────────────────────────
+        # ── Throttle / slider (NOT calibrated — full range intentional) ──
+        # The slider is an absolute control (0 = fully down, 100 = fully up)
+        # so we do NOT subtract a resting offset for it.
         if th_ax:
             ms.throttle_percent = round(th_ax.percent, 1)
         else:
-            ms.throttle_percent = 0.0
+            ms.throttle_percent = 50.0    # safe default = hold altitude
 
         return ms
+
+    # ------------------------------------------------------------------
+    # Calibrated percent helper
+    # ------------------------------------------------------------------
+
+    def _cal_pct(self, ax: AxisState | None) -> float:
+        """Return axis percent after subtracting the calibrated resting offset."""
+        if ax is None:
+            return 50.0
+        offset = self._cal_offsets.get(ax.name.lower(), 0.0)
+        # Subtract offset and re-centre to 50 %
+        adjusted = ax.percent - offset
+        # Clamp to [0, 100]
+        return max(0.0, min(100.0, adjusted))
 
 
 # ---------------------------------------------------------------------------
