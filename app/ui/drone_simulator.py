@@ -247,6 +247,20 @@ class DroneSimulatorWindow(QWidget):
                 btn.clicked.connect(lambda: self._view.set_camera_yaw(25.0))
             row.addWidget(btn)
 
+        # Zoom buttons
+        zi_btn = QPushButton("🔍+")
+        zi_btn.setFixedHeight(28); zi_btn.setFixedWidth(40)
+        zi_btn.clicked.connect(lambda: self._view.zoom_in())
+        row.addWidget(zi_btn)
+        zo_btn = QPushButton("🔍−")
+        zo_btn.setFixedHeight(28); zo_btn.setFixedWidth(40)
+        zo_btn.clicked.connect(lambda: self._view.zoom_out())
+        row.addWidget(zo_btn)
+        zr_btn = QPushButton("1:1")
+        zr_btn.setFixedHeight(28); zr_btn.setFixedWidth(36)
+        zr_btn.clicked.connect(lambda: self._view.zoom_reset())
+        row.addWidget(zr_btn)
+
         # Quick-action buttons
         arm_btn = QPushButton("ARM / DISARM")
         arm_btn.setObjectName("armBtn")
@@ -277,7 +291,7 @@ class DroneSimulatorWindow(QWidget):
     # ------------------------------------------------------------------
 
     def _build_3d_panel(self) -> QWidget:
-        box = QGroupBox("3D View  (◁ ▷ Orbit  |  Arrow Keys = orbit camera)")
+        box = QGroupBox("3D View  (◁ ▷ Orbit  |  +/− Zoom  |  Scroll = Zoom  |  Arrow Keys = orbit)")
         outer = QVBoxLayout(box)
         outer.setContentsMargins(2, 2, 2, 2)
         outer.setSpacing(4)
@@ -906,6 +920,13 @@ class DroneSimulatorWindow(QWidget):
             self._view.orbit(-5)
         elif key == Qt.Key.Key_Right:
             self._view.orbit(5)
+        # Zoom
+        elif key == Qt.Key.Key_Plus or key == Qt.Key.Key_Equal:
+            self._view.zoom_in()
+        elif key == Qt.Key.Key_Minus:
+            self._view.zoom_out()
+        elif key == Qt.Key.Key_0:
+            self._view.zoom_reset()
         else:
             super().keyPressEvent(event)
 

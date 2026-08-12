@@ -52,7 +52,7 @@ from app.core.drone_physics import DroneState, FlightMode
 # Scene constants
 # ===========================================================================
 
-SCALE     = 90.0    # pixels per metre — larger world feels bigger
+SCALE     = 90.0    # pixels per metre — base scale (zoom overrides this)
 TRAIL_LEN = 300     # longer trail for tactical situational awareness
 
 # ---------------------------------------------------------------------------
@@ -121,11 +121,14 @@ def _proj(wx: float, wy: float, wz: float,
     """
     rx =  wx * cc + wz * sc
     rz = -wx * sc + wz * cc
-    # DEPTH_X = how much Z offset shifts the screen horizontally
-    # DEPTH_Y = how much Z offset shifts the screen vertically
-    # Smaller values → flatter / more horizontal-looking ground
-    DEPTH_X = 0.18
-    DEPTH_Y = 0.09
+    # DEPTH_X = how much Z offset shifts the screen horizontally (oblique feel)
+    # DEPTH_Y = how much Z offset shifts the screen vertically (ground tilt)
+    # For a near-flat/level ground:
+    #   DEPTH_X = 0.30 keeps horizontal oblique so the scene feels 3D
+    #   DEPTH_Y = 0.04 makes Z barely lift/drop — ground looks nearly horizontal
+    # Satellite-above view: steep downward angle, slight oblique
+    DEPTH_X = 0.20   # mild horizontal skew
+    DEPTH_Y = 0.58   # steep top-down ~70 deg
     return (cx + rx * scale - rz * scale * DEPTH_X,
             cy - wy * scale + rz * scale * DEPTH_Y)
 
@@ -162,7 +165,7 @@ class Drone3DWidget(QWidget):
         super().__init__(parent)
         self._state = DroneState()
         self._trail: deque[tuple[float,float,float]] = deque(maxlen=TRAIL_LEN)
-        self._cam_yaw = 28.0
+        self._cam_yaw = 15.0   # slight tilt — satellite look
         rad = math.radians(self._cam_yaw)
         self._cam_cos = math.cos(rad)
         self._cam_sin = math.sin(rad)
@@ -173,7 +176,7 @@ class Drone3DWidget(QWidget):
 
         # Zoom — base scale in pixels/metre. Scroll wheel adjusts this.
         # Range: 20 (far out = wide area view) … 200 (close up)
-        self._zoom: float = SCALE   # start at default
+        self._zoom: float = 85.0   # satellite close-above: ~10mx15m visible at default
         self._zoom_min: float = 20.0
         self._zoom_max: float = 220.0
 
@@ -256,15 +259,21 @@ class Drone3DWidget(QWidget):
         cc, sc = self._cam_cos, self._cam_sin
         z = self._zoom   # current zoom level
 
-        # Camera origin — drone locked to centre of screen.
-        # cx: horizontal follow of world X.
-        # cy: vertical follow of world Y (altitude lifts view up) AND
-        #     world Z (depth with the flatter projection ratio 0.09).
-        # Using _zoom so both follow and grid scale together.
-        cx = w * 0.5 - self._fx * z * 0.55
-        cy = (h * 0.5 + 80
-              - self._fy * z          # altitude: rise with drone
-              - self._fz * z * 0.09)  # depth: small shift (matches DEPTH_Y)
+        # Camera origin — computed so that the drone sits exactly at screen
+        # centre regardless of zoom, yaw, or world position.
+        #
+        # Derivation: _proj(fx,fy,fz) must return (w/2, h/2+VERT_OFFSET).
+        # _proj returns:
+        #   sx = cx + (fx*cc + fz*sc)*z - (-fx*sc + fz*cc)*z*DEPTH_X
+        #   sy = cy - fy*z             + (-fx*sc + fz*cc)*z*DEPTH_Y
+        # Solve for cx,cy:
+        DEPTH_X = 0.20
+        DEPTH_Y = 0.58
+        VERT_OFFSET = 30   # drone sits near centre — more ground visible below   # push drone slightly above screen centre
+        rx_ = self._fx * cc + self._fz * sc
+        rz_ = -self._fx * sc + self._fz * cc
+        cx  = w * 0.5 - z * (rx_ - rz_ * DEPTH_X)
+        cy  = h * 0.5 + VERT_OFFSET + self._fy * z - rz_ * z * DEPTH_Y
 
         self._draw_environment(p, w, h, cx, cy, cc, sc, z)
         self._draw_trail(p, cx, cy, cc, sc, z)
@@ -278,13 +287,13 @@ class Drone3DWidget(QWidget):
     # ENVIRONMENT
     # ==================================================================
 
-    def _draw_environment(self, p, w, h, cx, cy, cc, sc) -> None:
+    def _draw_environment(self, p, w, h, cx, cy, cc, sc, z=90.0) -> None:
         self._draw_sky(p, w, h)
-        self._draw_terrain(p, w, h, cx, cy, cc, sc)
-        self._draw_range_rings(p, cx, cy, cc, sc)
-        self._draw_grid(p, cx, cy, cc, sc)
-        self._draw_origin_marker(p, cx, cy, cc, sc)
-        self._draw_compass_ground(p, cx, cy, cc, sc)
+        self._draw_terrain(p, w, h, cx, cy, cc, sc, z)
+        self._draw_range_rings(p, cx, cy, cc, sc, z)
+        self._draw_grid(p, cx, cy, cc, sc, z)
+        self._draw_origin_marker(p, cx, cy, cc, sc, z)
+        self._draw_compass_ground(p, cx, cy, cc, sc, z)
 
     # ------------------------------------------------------------------
     # Sky with star field and horizon glow
@@ -317,7 +326,7 @@ class Drone3DWidget(QWidget):
     # Terrain surface with subtle texture lines
     # ------------------------------------------------------------------
 
-    def _draw_terrain(self, p, w, h, cx, cy, cc, sc) -> None:
+    def _draw_terrain(self, p, w, h, cx, cy, cc, sc, z=90.0) -> None:
         s = self._state
         # Subtle diagonal texture lines on terrain
         tex_pen = QPen(QColor(25, 38, 20, 40), 1)
@@ -328,14 +337,14 @@ class Drone3DWidget(QWidget):
             wx = ox + i * 10
             # Diagonal texture at 45°
             p.drawLine(
-                _qpt(wx, 0, oz - 80, cx, cy, cc, sc),
-                _qpt(wx + 40, 0, oz + 40, cx, cy, cc, sc))
+                _qpt(wx, 0, oz - 80, cx, cy, cc, sc, z),
+                _qpt(wx + 40, 0, oz + 40, cx, cy, cc, sc, z))
 
     # ------------------------------------------------------------------
     # Range rings — tactical distance markers
     # ------------------------------------------------------------------
 
-    def _draw_range_rings(self, p, cx, cy, cc, sc) -> None:
+    def _draw_range_rings(self, p, cx, cy, cc, sc, z=90.0) -> None:
         s = self._state
         for ring_r, label in ((25, "25"), (50, "50"), (100, "100")):
             alpha = max(20, 80 - int(s.altitude * 2))
@@ -346,11 +355,11 @@ class Drone3DWidget(QWidget):
                 rad = math.radians(deg)
                 wx = math.sin(rad) * ring_r
                 wz = -math.cos(rad) * ring_r
-                pts.append(_qpt(wx, 0, wz, cx, cy, cc, sc))
+                pts.append(_qpt(wx, 0, wz, cx, cy, cc, sc, z))
             for i in range(len(pts) - 1):
                 p.drawLine(pts[i], pts[i+1])
             # Range label at East position
-            lx, ly = _proj(ring_r, 0, 0, cx, cy, cc, sc)
+            lx, ly = _proj(ring_r, 0, 0, cx, cy, cc, sc, z)
             p.setFont(QFont("Consolas", 7))
             p.setPen(QPen(QColor(40, 120, 40, alpha + 40)))
             p.drawText(int(lx)+2, int(ly)-2, 28, 12,
@@ -360,7 +369,7 @@ class Drone3DWidget(QWidget):
     # Tactical grid — 5 m spacing, 50 m sector labels
     # ------------------------------------------------------------------
 
-    def _draw_grid(self, p, cx, cy, cc, sc) -> None:
+    def _draw_grid(self, p, cx, cy, cc, sc, z=90.0) -> None:
         s   = self._state
         GAP = 5.0    # 5 m grid squares
         N   = 20     # 20 lines each side = 100 m radius
@@ -380,17 +389,17 @@ class Drone3DWidget(QWidget):
             p.setPen(pen)
 
             wz = oz + i * GAP
-            p.drawLine(_qpt(ox-N*GAP, 0, wz, cx, cy, cc, sc),
-                       _qpt(ox+N*GAP, 0, wz, cx, cy, cc, sc))
+            p.drawLine(_qpt(ox-N*GAP, 0, wz, cx, cy, cc, sc, z),
+                       _qpt(ox+N*GAP, 0, wz, cx, cy, cc, sc, z))
             wx = ox + i * GAP
-            p.drawLine(_qpt(wx, 0, oz-N*GAP, cx, cy, cc, sc),
-                       _qpt(wx, 0, oz+N*GAP, cx, cy, cc, sc))
+            p.drawLine(_qpt(wx, 0, oz-N*GAP, cx, cy, cc, sc, z),
+                       _qpt(wx, 0, oz+N*GAP, cx, cy, cc, sc, z))
 
         # Sector labels every 25 m
         p.setFont(QFont("Consolas", 7))
         for d in (-75, -50, -25, 0, 25, 50, 75):
             wx = round((s.x + d) / 25) * 25
-            sx, sy = _proj(wx, 0, oz, cx, cy, cc, sc)
+            sx, sy = _proj(wx, 0, oz, cx, cy, cc, sc, z)
             p.setPen(QPen(QColor(50, 120, 50, 100)))
             p.drawText(int(sx)-14, int(sy)+2, 28, 11,
                        Qt.AlignmentFlag.AlignCenter, f"{int(wx)}")
@@ -399,16 +408,16 @@ class Drone3DWidget(QWidget):
     # Origin marker — runway-style cross
     # ------------------------------------------------------------------
 
-    def _draw_origin_marker(self, p, cx, cy, cc, sc) -> None:
+    def _draw_origin_marker(self, p, cx, cy, cc, sc, z=90.0) -> None:
         L = 3.0  # arm length metres
         pen = QPen(_C_AMBER, 2)
         p.setPen(pen)
-        p.drawLine(_qpt(-L, 0,  0, cx, cy, cc, sc),
-                   _qpt( L, 0,  0, cx, cy, cc, sc))
-        p.drawLine(_qpt( 0, 0, -L, cx, cy, cc, sc),
-                   _qpt( 0, 0,  L, cx, cy, cc, sc))
+        p.drawLine(_qpt(-L, 0,  0, cx, cy, cc, sc, z),
+                   _qpt( L, 0,  0, cx, cy, cc, sc, z))
+        p.drawLine(_qpt( 0, 0, -L, cx, cy, cc, sc, z),
+                   _qpt( 0, 0,  L, cx, cy, cc, sc, z))
         # Origin dot
-        ox, oy = _proj(0, 0, 0, cx, cy, cc, sc)
+        ox, oy = _proj(0, 0, 0, cx, cy, cc, sc, z)
         p.setBrush(QBrush(_C_AMBER))
         p.setPen(_PN)
         p.drawEllipse(QPointF(ox, oy), 4, 3)
@@ -417,7 +426,7 @@ class Drone3DWidget(QWidget):
     # Ground compass with large tactical labels
     # ------------------------------------------------------------------
 
-    def _draw_compass_ground(self, p, cx, cy, cc, sc) -> None:
+    def _draw_compass_ground(self, p, cx, cy, cc, sc, z=90.0) -> None:
         s = self._state
         R = 12.0  # metres from drone centre
 
@@ -429,7 +438,7 @@ class Drone3DWidget(QWidget):
         ]
         p.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
         for lbl, dx, dz, col in dirs:
-            sx, sy = _proj(s.x+dx, 0, s.z+dz, cx, cy, cc, sc)
+            sx, sy = _proj(s.x+dx, 0, s.z+dz, cx, cy, cc, sc, z)
             # Filled badge
             p.setBrush(QBrush(QColor(col.red(), col.green(), col.blue(), 170)))
             p.setPen(_PN)
@@ -443,14 +452,14 @@ class Drone3DWidget(QWidget):
         nx = s.x + math.sin(yr) * 6.0
         nz = s.z - math.cos(yr) * 6.0
         p.setPen(QPen(QColor(255, 176, 0, 200), 2))
-        p.drawLine(_qpt(s.x, 0, s.z, cx, cy, cc, sc),
+        p.drawLine(_qpt(s.x, 0, s.z, cx, cy, cc, sc, z),
                    _qpt(nx,  0, nz,  cx, cy, cc, sc))
 
     # ==================================================================
     # TRAIL
     # ==================================================================
 
-    def _draw_trail(self, p, cx, cy, cc, sc) -> None:
+    def _draw_trail(self, p, cx, cy, cc, sc, z=90.0) -> None:
         trail = list(self._trail)
         n = len(trail)
         if n < 2:
@@ -462,7 +471,7 @@ class Drone3DWidget(QWidget):
             r = int(255 * (1 - frac) * 0.7)
             g = int(180 * frac + 60)
             p.setPen(QPen(QColor(r, g, 40, alpha), 2))
-            ax, ay = _proj(*trail[i-1], cx, cy, cc, sc)
+            ax, ay = _proj(*trail[i-1], cx, cy, cc, sc, z)
             bx, by = _proj(*trail[i],   cx, cy, cc, sc)
             p.drawLine(QPointF(ax, ay), QPointF(bx, by))
 
@@ -470,14 +479,14 @@ class Drone3DWidget(QWidget):
     # SHADOW
     # ==================================================================
 
-    def _draw_shadow(self, p, cx, cy, cc, sc) -> None:
+    def _draw_shadow(self, p, cx, cy, cc, sc, z=90.0) -> None:
         s = self._state
         if s.y < 0.1:
             return
         alpha = max(0, int(120 - s.y * 5))
         if alpha <= 0:
             return
-        sx, sy = _proj(s.x, 0, s.z, cx, cy, cc, sc)
+        sx, sy = _proj(s.x, 0, s.z, cx, cy, cc, sc, z)
         rx = max(8, int(70 - s.y * 2))
         ry = int(rx * 0.30)
         # Shadow gradient
@@ -492,7 +501,7 @@ class Drone3DWidget(QWidget):
     # DRONE — MQ-style quadrotor UAV
     # ==================================================================
 
-    def _draw_drone(self, p, cx, cy, cc, sc) -> None:
+    def _draw_drone(self, p, cx, cy, cc, sc, z=90.0) -> None:
         s   = self._state
         ARM = 0.75   # longer booms for bigger presence
 
@@ -517,7 +526,7 @@ class Drone3DWidget(QWidget):
             b2w( ARM, 0,  ARM),  # BR
         ]
 
-        def wp(wx, wy, wz): return _qpt(wx, wy, wz, cx, cy, cc, sc)
+        def wp(wx, wy, wz): return _qpt(wx, wy, wz, cx, cy, cc, sc, z)
         cpt = wp(s.x, s.y, s.z)
 
         # ── Landing gear (shown only near ground) ────────────────────
@@ -605,7 +614,7 @@ class Drone3DWidget(QWidget):
 
         # ── Rotors ────────────────────────────────────────────────────
         if s.rotor_speed > 0.01:
-            self._draw_rotors(p, cx, cy, cc, sc, motors, s)
+            self._draw_rotors(p, cx, cy, cc, sc, motors, s, z)
 
         # ── Navigation lights (aviation standard) ────────────────────
         if s.mode != FlightMode.DISARMED:
@@ -642,7 +651,7 @@ class Drone3DWidget(QWidget):
             p.drawLine(wp(s.x, 0, s.z), cpt)
             # Altitude tick marks every 5 m
             for alt_m in range(5, int(s.y) + 1, 5):
-                tx, ty = _proj(s.x, alt_m, s.z, cx, cy, cc, sc)
+                tx, ty = _proj(s.x, alt_m, s.z, cx, cy, cc, sc, z)
                 p.setPen(QPen(QColor(40, 130, 40, 100), 1))
                 p.drawLine(QPointF(tx - 6, ty), QPointF(tx + 6, ty))
 
@@ -667,18 +676,18 @@ class Drone3DWidget(QWidget):
         p.setBrush(QBrush(_C_AMBER))
         p.setPen(QPen(QColor(0, 0, 0, 180), 1))
         p.drawEllipse(np_, 6, 4)
-        nsx, nsy = _proj(nwx, nwy, nwz, cx, cy, cc, sc)
+        nsx, nsy = _proj(nwx, nwy, nwz, cx, cy, cc, sc, z)
         p.setPen(QPen(_C_AMBER))
         p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
         p.drawText(int(nsx)-14, int(nsy)-16, 28, 12,
                    Qt.AlignmentFlag.AlignCenter, "FWD")
 
-    def _draw_rotors(self, p, cx, cy, cc, sc, motors, s: DroneState) -> None:
+    def _draw_rotors(self, p, cx, cy, cc, sc, motors, s: DroneState, z=90.0) -> None:
         R     = 0.55   # large tactical rotor radius
         speed = s.rotor_speed
 
         for i, (mx, my, mz) in enumerate(motors):
-            mp  = _qpt(mx, my, mz, cx, cy, cc, sc)
+            mp  = _qpt(mx, my, mz, cx, cy, cc, sc, z)
             ang = s.rotor_angles[i]
 
             # Rotor guard ring (static)
@@ -715,7 +724,7 @@ class Drone3DWidget(QWidget):
     # VELOCITY VECTOR
     # ==================================================================
 
-    def _draw_velocity_vector(self, p, cx, cy, cc, sc) -> None:
+    def _draw_velocity_vector(self, p, cx, cy, cc, sc, z=90.0) -> None:
         s   = self._state
         spd = s.speed_h
         if spd < 0.4:
@@ -727,7 +736,7 @@ class Drone3DWidget(QWidget):
         uvx, uvz = s.vx / vlen, s.vz / vlen
         tx  = s.x + uvx * scale
         tz  = s.z + uvz * scale
-        bp  = _qpt(s.x, s.y, s.z, cx, cy, cc, sc)
+        bp  = _qpt(s.x, s.y, s.z, cx, cy, cc, sc, z)
         tp  = _qpt(tx,  s.y, tz,  cx, cy, cc, sc)
 
         # Glow behind the arrow
@@ -1216,3 +1225,4 @@ class Drone3DWidget(QWidget):
         p.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
         p.drawText(int(mx-MR), int(my-MR-12), MR*2, 11,
                    Qt.AlignmentFlag.AlignCenter, "◆ RADAR ◆")
+
