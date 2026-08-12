@@ -1,4 +1,4 @@
-# USB Device Inspector
+# 3D Drone Controller Test
 
 A professional Windows desktop application that detects, inspects, and monitors
 every USB device connected to your computer — including a full real-time controller
@@ -31,21 +31,21 @@ joystick.
 
 ## Overview
 
-USB Device Inspector is a read-only Windows desktop application built with
+ Device Inspector is a read-only Windows desktop application built with
 Python 3.13 and PySide6. It never modifies connected devices, installs drivers,
-or executes any content from USB media. All data comes from the Windows PnP
+or executes any content from  media. All data comes from the Windows PnP
 layer (WMI / hidapi).
 
 ### Application workflow
 
 ```
-USB Device Connected
+ Device Connected
         │
         ▼
 WMI Win32_PnPEntity enumeration
         │
         ▼
-Normalize + Classify  →  USBDevice + DeviceCategory
+Normalize + Classify  →  Device + DeviceCategory
         │
         ▼
 Device List (main window)
@@ -73,8 +73,8 @@ Device List (main window)
 
 ## Features
 
-### USB Detection and Inspection
-- Enumerates all USB devices on startup via `Win32_PnPEntity`
+###  Detection and Inspection
+- Enumerates all  devices on startup via `Win32_PnPEntity`
 - Real-time plug/unplug monitoring via WMI event notifications
 - Graceful handling of device removal during scanning
 - Per-device scan with progress dialog (runs on background thread)
