@@ -168,7 +168,7 @@ class DroneSimulatorWindow(QWidget):
         self._calibrated_logged = False   # log calibration data once
 
         self.setWindowTitle(
-            f"🚁  Drone Simulator — {device.name or device.device_id}")
+            f"✈  Fixed-Wing UAV Simulator — {device.name or device.device_id}")
         self.resize(1280, 760)
         self.setMinimumSize(900, 580)
         self.setStyleSheet(_STYLE)
@@ -215,7 +215,7 @@ class DroneSimulatorWindow(QWidget):
         row = QHBoxLayout()
         row.setSpacing(10)
 
-        icon_lbl = QLabel("🚁")
+        icon_lbl = QLabel("✈")
         icon_lbl.setStyleSheet("font-size:22px;")
         row.addWidget(icon_lbl)
 
