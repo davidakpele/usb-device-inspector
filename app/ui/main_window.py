@@ -209,7 +209,7 @@ class MainWindow(QMainWindow):
         self._test_btn.clicked.connect(self._on_test_controller)
         btn_row.addWidget(self._test_btn)
 
-        self._drone_btn = QPushButton("🚁  Drone Simulator")
+        self._drone_btn = QPushButton("✈  Drone Simulator")
         self._drone_btn.setEnabled(False)
         self._drone_btn.setVisible(False)
         self._drone_btn.setObjectName("primaryButton")

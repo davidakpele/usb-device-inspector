@@ -2,8 +2,8 @@
 
 A professional Windows desktop application that detects, inspects, and monitors
 every USB device connected to your computer — including a full real-time controller
-input monitor and a military-grade 3D drone flight simulator controlled by your
-joystick.
+input monitor and a military-grade 3D fixed-wing UAV flight simulator controlled by
+your joystick.
 
 ---
 
@@ -20,6 +20,13 @@ joystick.
 9. [Device Inspection](#device-inspection)
 10. [Controller Live Monitor](#controller-live-monitor)
 11. [Drone Simulator](#drone-simulator)
+    - [How to fly](#how-to-fly)
+    - [Controller mapping](#controller-mapping)
+    - [Throttle / altitude-hold model](#throttle--altitude-hold-model)
+    - [Physics model](#physics-model)
+    - [Flight modes and speeds](#flight-modes-and-speeds)
+    - [3D View](#3d-view--fixed-wing-uav-renderer-pure-qpainter-no-opengl)
+    - [Architecture — data flow](#architecture--data-flow-through-simulator)
 12. [Device History](#device-history)
 13. [Flight Logging](#flight-logging)
 14. [Application Logging](#application-logging)
@@ -58,7 +65,7 @@ Device List (main window)
         │               │
         │               └── ControllerTestWidget (axes/buttons/direction)
         │
-        └── [Game Controller] → 🚁 Drone Simulator
+        └── [Game Controller] → ✈ Drone Simulator
                 │
                 └── ControllerMonitorThread (120 Hz HID)
                         │
@@ -66,7 +73,7 @@ Device List (main window)
                 DronePhysics (60 Hz, altitude-hold)
                         │
                         ▼
-                Drone3DWidget (QPainter, satellite view)
+                Drone3DWidget (QPainter, fixed-wing UAV)
 ```
 
 ---
@@ -110,8 +117,8 @@ Device List (main window)
 - Joystick canvas with trail, direction arrow, velocity vector
 - Hat compass rose, button grid, motion log, event log
 
-### Drone Simulator (🚁 Drone Simulator)
-Full 3D UAV flight simulator controlled by the physical joystick.
+### Drone Simulator (✈ Drone Simulator)
+Full 3D fixed-wing UAV flight simulator controlled by the physical joystick.
 See [Drone Simulator](#drone-simulator) section below.
 
 ### Device History
@@ -311,13 +318,13 @@ Hardware Identification, Driver.
 
 | File | Key contents |
 |---|---|
-| `main_window.py` | `MainWindow` — dark Catppuccin theme; buttons: Inspect, Scan, 🎮 Test Controller Live, 🚁 Drone Simulator (controller only), Refresh, Device History |
+| `main_window.py` | `MainWindow` — dark Catppuccin theme; buttons: Inspect, Scan, 🎮 Test Controller Live, ✈ Drone Simulator (controller only), Refresh, Device History |
 | `device_list.py` | `DeviceListWidget` — connection-state dot, category, VID/PID |
 | `device_details.py` | `DeviceDetailsWidget` — tabbed sections, source badges, capabilities |
 | `scan_dialog.py` | `ScanDialog` — modal progress at 10/50/90/100% |
 | `event_log.py` | `EventLogWidget` — colour-coded, 500-entry cap |
 | `controller_test_widget.py` | `ControllerTestWidget` — 60 Hz render timer, 3-column layout |
-| `drone_3d_view.py` | `Drone3DWidget` — pure QPainter satellite view renderer |
+| `drone_3d_view.py` | `Drone3DWidget` — pure QPainter oblique-projection renderer; `_FixedWingUAV` geometry class |
 | `drone_simulator.py` | `DroneSimulatorWindow` — full GCS-style simulator window |
 
 ---
@@ -449,7 +456,7 @@ for bit-exact decoding during live monitoring.
 
 ## Drone Simulator
 
-Opened via **🚁 Drone Simulator** (Game Controller devices only).
+Opened via **✈ Drone Simulator** (Game Controller devices only).
 Requires scanning the device first to get the precise HID field map.
 
 ### How to fly
@@ -458,7 +465,7 @@ Requires scanning the device first to get the precise HID field map.
 2. Click **🚀 TAKE-OFF** or press Button 7 → auto-climbs to 3 m, enters HOVER
 3. Move the **stick** in any direction to fly
 4. Move the **slider** above 50% to climb, below 50% to descend
-5. **Twist** the handle (Rz) to rotate in place
+5. **Twist** the handle (Rz) to rotate in place (yaw)
 6. Click **⬇ LAND** or press Button 2 → auto-descends and disarms
 
 ### Controller mapping
@@ -503,7 +510,7 @@ The drone will not crash from a momentarily-released slider.
 - World velocity = `rotate(unit_dir, yaw) × magnitude × max_speed`
 - Drag: 3× stronger when stick released (brakes quickly)
 - Visual tilt derived from actual world velocity (not stick input)
-- Rotor speed proportional to effort
+- Engine/rotor speed proportional to throttle effort
 - Button edge detection: fires once per press regardless of hold duration
 
 ### Flight modes and speeds
@@ -515,7 +522,7 @@ The drone will not crash from a momentarily-released slider.
 | SPORT | 18 m/s | 200°/s |
 | PRECISION | 3 m/s | 50°/s |
 
-### 3D View — military-grade renderer (pure QPainter, no OpenGL)
+### 3D View — fixed-wing UAV renderer (pure QPainter, no OpenGL)
 
 **Camera**: Satellite-station-above perspective (70° top-down tilt).
 Drone is always locked at screen centre regardless of position or zoom.
@@ -526,7 +533,7 @@ Camera follow is mathematically exact — zero pixel error at all zoom levels.
 - `🔍+` / `🔍−` / `1:1` buttons in header
 - Keyboard `+` / `−` / `0`
 - Range: 20 px/m (100 m+ view) → 220 px/m (close-up ~4 m view)
-- Default: 85 px/m (~10×15 m visible area
+- Default: 85 px/m (~10×15 m visible area)
 
 **Projection constants**:
 
@@ -534,7 +541,7 @@ Camera follow is mathematically exact — zero pixel error at all zoom levels.
 |---|---|---|
 | `DEPTH_X` | 0.20 | Mild horizontal oblique — clean top-down |
 | `DEPTH_Y` | 0.58 | Steep 70° downward tilt — satellite feel |
-| `cam_yaw` default | 15° | Slight rotation for 3D depth |
+| `cam_yaw` default | 25° | Three-quarter front-side view for best UAV perspective |
 
 **Environment layers** (back to front):
 1. Night sky — gradient + 120 pre-cached stars + NVG horizon glow
@@ -545,24 +552,52 @@ Camera follow is mathematically exact — zero pixel error at all zoom levels.
 6. Ground compass — N/S/E/W badges always centred on drone
 7. Flight trail — amber→green colour fade over 300 points
 8. Altitude shadow — radial gradient, fades with height
-9. Drone body (see below)
+9. Fixed-wing UAV body (see below)
 10. Velocity vector — green arrow, glow, speed label
 
-**Drone body — MQ-style quadrotor UAV**:
+**Fixed-wing UAV body — Reconnaissance UAV**:
+
+The aircraft is built entirely in body frame by the `_FixedWingUAV` class and
+projected to screen via the same oblique `_proj()` formula used by the rest of
+the scene. No external model file is required.
+
+Body-frame coordinate convention:
+- `+X` = right wing tip direction
+- `+Y` = up (dorsal)
+- `−Z` = forward (nose) — standard aerospace convention
 
 | Part | Detail |
 |---|---|
-| Booms | 0.75 m carbon-fibre tubes, dark with bright-edge highlight |
-| Body | Hexagonal fuselage with panel detail lines |
-| Camera | Gimbal dome — dark blue glass, lens reflection |
-| Electronics | Top dome + antenna stub |
-| Motors | Detailed pods with vent lines |
-| Rotors | 0.55 m disc, rotor guard ring, 4-blade lines with blur |
-| Nav lights | Green port (FL), red starboard (FR), white rear strobe (blinks) |
-| Landing gear | 4 legs with foot pads, retract above 1.5 m |
-| Altitude stem | Dashed line + 5 m tick marks |
-| Rotor wash | 3-layer turbulence glow below when flying |
-| FWD marker | Amber dot + "FWD" label at drone nose |
+| Fuselage | Tapered hexagonal cross-section, 17 longitudinal stations, ogive nose, tail boom; longitudinal panel lines |
+| Main wings | Swept trapezoidal panels, left and right; leading-edge dark strip; slight dihedral at tip |
+| Horizontal stabiliser | Smaller tail planes, port and starboard |
+| Vertical stabiliser | Dorsal fin with dark leading-edge strip |
+| Ailerons | Trailing-edge panels on each wing, deflect ±22° from `state.roll` (differential — left up when right down) |
+| Elevator | Trailing edge of horizontal stab, deflects ±20° from `state.pitch` |
+| Rudder | Trailing edge of vertical fin, deflects ±18° from roll/yaw |
+| Sensor pod | Streamlined EO/IR ball under nose — dark body, blue glass aperture, lens reflection |
+| Propeller | 2-blade nose tractor: disc blur fades in with `rotor_speed`; blade lines visible when slow; spinner hub |
+| Landing gear | Tricycle (nose + two mains), retracts above 1.5 m AGL; wheels drawn as ovals |
+| Nav lights | Green port wingtip, red starboard wingtip, white tail strobe (blinks every 30 frames) |
+| Engine exhaust | Twin exhaust rings at rear belly; orange heat-glow shimmer at speed |
+| Engine wash | Radial turbulence glow around drone when flying |
+| Altitude stem | Dashed vertical line + 5 m tick marks |
+| FWD marker | Amber dot + "FWD" label ahead of nose |
+
+**Control surface animation**:
+
+Control surfaces deflect in real time from the physics state — purely visual,
+no secondary physics effect:
+
+| DroneState field | Surface | Max deflection |
+|---|---|---|
+| `roll` | Left / right ailerons (differential) | ±22° |
+| `pitch` | Elevator (both sides) | ±20° |
+| `roll` (yaw proxy) | Rudder | ±18° |
+| `rotor_speed` | Propeller disc opacity + blade fade | 0→1 |
+
+Active surfaces switch to a lighter composite colour so deflection is visible
+against the fixed structure.
 
 **HUD panels** (tactical GCS style):
 
@@ -579,6 +614,56 @@ Camera follow is mathematically exact — zero pixel error at all zoom levels.
 | Radar mini-map | Bottom corner | Range rings, trail, heading arrow, RADAR label |
 | Crosshair | Centre | FPV reticle with corner ticks |
 | Scanlines | Full screen | Subtle CRT/NVG effect |
+
+### Architecture — data flow through simulator
+
+```
+Physical Controller (USB HID)
+        │  ~120 Hz raw bytes
+        ▼
+ControllerMonitorThread
+  ReportDecoder  →  MotionInterpreter
+        │  Signal: state_updated(InputState)
+        ▼
+DroneSimulatorWindow._on_controller_state()
+  [stores snapshot only]
+        │
+        ▼  QTimer 60 Hz
+DroneSimulatorWindow._physics_tick()
+  _build_drone_input()
+    inp.roll     = motion.x_coord
+    inp.pitch    = motion.y_coord
+    inp.yaw      = twist_raw
+    inp.throttle = throttle_percent / 100
+    inp.btn_*    = rising-edge detection
+        │
+        ▼
+DronePhysics.step(inp, dt)  →  DroneState
+        │
+        ├── DroneSimulatorWindow._update_telemetry()
+        ├── DroneSimulatorWindow._update_mode_label()
+        │
+        ▼
+Drone3DWidget.update_state(DroneState)
+        │  _prop_angle += rotor_speed × 18°/frame
+        │  smooth camera follow (α=0.18 / 0.08)
+        ▼
+paintEvent() → _draw_drone()
+  b2w(bx,by,bz)  = roll → pitch → yaw → translate
+  _proj(wx,wy,wz) = oblique projection → screen pixels
+  _FixedWingUAV.draw_fuselage()
+  _FixedWingUAV.draw_wings(aileron_defl)
+  _FixedWingUAV.draw_hstab(elevator_defl)
+  _FixedWingUAV.draw_vstab(rudder_defl)
+  _FixedWingUAV.draw_sensor_pod()
+  _FixedWingUAV.draw_propeller(prop_angle, rotor_speed)
+  _FixedWingUAV.draw_landing_gear(altitude)
+  _FixedWingUAV.draw_nav_lights(armed, rotor_speed, frame)
+  _FixedWingUAV.draw_engine_detail(rotor_speed)
+        │
+        ▼
+Rendered Fixed-Wing UAV on tactical display
+```
 
 ---
 
@@ -715,5 +800,5 @@ DeviceManager              ← thread-safe registry
 - **Exclusive-access HID devices** — Report descriptor shows "Not accessible"; all other info still displayed.
 - **USB Version** — `Win32_PnPEntity` does not expose USB 1.1/2.0/3.x for most devices.
 - **Parent device** — Not directly exposed by `Win32_PnPEntity`.
-- **Drone simulator** — Pure 2D oblique projection (no OpenGL). Performance adequate at 60 Hz on any modern CPU.
-- **Drone physics** — Simplified altitude-hold model, not aerodynamically accurate. Designed for control responsiveness and crash-resistance, not realism.
+- **Drone simulator** — Pure 2D oblique projection (no OpenGL). Performance adequate at 60 Hz on any modern CPU. Aircraft geometry is procedurally generated via QPainter — no external 3D model file required.
+- **Drone physics** — Simplified altitude-hold model, not aerodynamically accurate. Designed for control responsiveness and crash-resistance. Control surface deflections (ailerons, elevator, rudder) are visual only — they do not feed back into the physics engine.
